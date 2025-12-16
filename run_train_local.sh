@@ -2,7 +2,7 @@
 # 一键启动 Spider 训练（Qwen3-4B-Instruct 4×24GB 配置）
 set -e
 
-ROOT="/home/lthpc/student/LiTengfei/project/myfork/agent-lightning"
+ROOT="/home/lthpc/student/LiTengfei/project/verl_pass/agent-lightning"
 SPIDER_DIR="$ROOT/examples/spider"
 cd "$SPIDER_DIR"
 
@@ -20,13 +20,13 @@ export RAY_TMPDIR=/home/lthpc/raytmp
 export VERL_SPIDER_DATA_DIR="$SPIDER_DIR/data"
 
 # Lightning store 端口（并行跑多个实例时改成不同端口，比如 AGL_SERVER_PORT=4748）
-export AGL_SERVER_PORT="${AGL_SERVER_PORT:-4748}"
+export AGL_SERVER_PORT="${AGL_SERVER_PORT:-4750}"
 
 # 可选：关闭 wandb 需设 WANDB_DISABLED=true
 # export WANDB_DISABLED=true
 
 # 配置路径（直接在此处硬编码，修改更方便）
-CONFIG_PATH="/home/lthpc/student/LiTengfei/project/myfork/agent-lightning/examples/spider/configs/singleGPU_qwen05b.json"
+CONFIG_PATH="/home/lthpc/student/LiTengfei/project/verl_pass/agent-lightning/examples/spider/configs/singleGPU_qwen05b.json"
 CONFIG_STEM="$(basename "$CONFIG_PATH" .json)"
 
 # 日志文件
@@ -46,7 +46,7 @@ echo "Git branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'n/a')" 
 echo "Git commit: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')" >> "$LOG_FILE"
 echo "========================================" >> "$LOG_FILE"
 
-CUDA_VISIBLE_DEVICES=2 nohup "$PYTHON_BIN" train_sql_agent.py local_qwen05 --config-file "$CONFIG_PATH" \
+CUDA_VISIBLE_DEVICES=7 nohup "$PYTHON_BIN" train_sql_agent.py local_qwen05 --config-file "$CONFIG_PATH" \
   >> "$LOG_FILE" 2>&1 &
 
 echo "Training started with PID $!"

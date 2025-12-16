@@ -13,6 +13,9 @@ Usage:
     python train_sql_agent.py fast    # Fast training for CI/testing
     python train_sql_agent.py qwen    # Standard Qwen model training
     python train_sql_agent.py llama   # LLaMA model training
+    # Two-stage Pass@k curriculum:
+    python train_sql_agent.py qwen --stage 1 --passk-k 8 --passk-mode bootstrap   # exploratory stage
+    python train_sql_agent.py qwen --stage 2 --passk-k 1 --resume-ckpt /path/to/stage1_ckpt  # exploit stage
 
 The script uses reinforcement learning with VERL framework
 to train agents on the Spider dataset for text-to-SQL generation tasks.
@@ -38,7 +41,14 @@ from sql_agent import LitSQLAgent
 import agentlightning as agl
 RL_TRAINING_CONFIG: Dict[str, Any] = {
     "algorithm": {
-        "adv_estimator": "grpo",
+        # Default to Pass@k-aware estimator; CLI can switch k/mode per training stage.
+        "adv_estimator": "grpo_passk_seed",
+        "passk_k": 4,
+        "passk_mode": "analytic",
+        "passk_bootstrap_B": 512,
+        "passk_bootstrap_with_replacement": True,
+        "passk_bootstrap_count_multiplicity": True,
+        "passk_norm_by_std": True,
         "use_kl_in_reward": False,
     },
     "data": {
@@ -312,6 +322,71 @@ def config_train_fast() -> Dict[str, Any]:
     return config
 
 
+def _apply_passk_overrides(config: Dict[str, Any], args: argparse.Namespace) -> None:
+    """Inject Pass@k curriculum options into the config."""
+
+    algo = config.setdefault("algorithm", {})
+    algo["adv_estimator"] = "grpo_passk_seed"
+    algo.setdefault("norm_adv_by_std_in_grpo", algo.get("passk_norm_by_std", True))
+    algo.setdefault("passk_norm_by_std", algo.get("norm_adv_by_std_in_grpo", True))
+
+    stage_default_k = 4 if args.stage == 1 else 1
+    algo.setdefault("passk_k", stage_default_k)
+    algo.setdefault("passk_mode", "analytic" if args.stage == 2 else "analytic")
+    algo.setdefault("passk_bootstrap_B", 512)
+    algo.setdefault("passk_bootstrap_with_replacement", False)  # align with analytic (combinatorial, no replacement)
+    algo.setdefault("passk_bootstrap_count_multiplicity", True)
+    algo.setdefault("passk_adv_scale_factor", 1.0)
+    algo.setdefault("passk_debug_assert_full_group", True)
+
+    if args.passk_k is not None:
+        algo["passk_k"] = args.passk_k
+    if args.passk_mode is not None:
+        algo["passk_mode"] = args.passk_mode
+    if args.passk_bootstrap_B is not None:
+        algo["passk_bootstrap_B"] = args.passk_bootstrap_B
+    if args.passk_bootstrap_without_replacement:
+        algo["passk_bootstrap_with_replacement"] = False
+    if args.passk_bootstrap_unique:
+        algo["passk_bootstrap_count_multiplicity"] = False
+    if args.no_passk_std_norm:
+        algo["passk_norm_by_std"] = False
+        algo["norm_adv_by_std_in_grpo"] = False
+    if args.passk_adv_scale_factor is not None:
+        algo["passk_adv_scale_factor"] = args.passk_adv_scale_factor
+
+    # Stage defaults if user did not override
+    if args.stage == 2 and args.passk_k is None:
+        algo["passk_k"] = 1
+    if args.stage == 2 and args.passk_mode is None:
+        algo["passk_mode"] = "analytic"
+
+    rollout_cfg = config.setdefault("actor_rollout_ref", {}).setdefault("rollout", {})
+    if args.rollout_n is not None:
+        rollout_cfg["n"] = args.rollout_n
+    elif args.stage == 1:
+        # Encourage exploration in stage-1; keep lightweight defaults otherwise.
+        rollout_cfg["n"] = max(rollout_cfg.get("n", 1), 8)
+
+    # Hard safety: n must be >= k to avoid silent degradation.
+    final_n = rollout_cfg.get("n", 1)
+    if final_n < algo["passk_k"]:
+        raise ValueError(f"rollout.n ({final_n}) must be >= passk_k ({algo['passk_k']})")
+    algo["expected_rollout_n"] = final_n
+
+    if args.resume_ckpt:
+        config.setdefault("trainer", {})["resume_from_checkpoint"] = args.resume_ckpt
+
+    print(
+        "[Pass@k config] "
+        f"stage={args.stage} n={rollout_cfg.get('n')} k={algo['passk_k']} mode={algo['passk_mode']} "
+        f"B={algo['passk_bootstrap_B']} replace={algo['passk_bootstrap_with_replacement']} "
+        f"multiplicity={algo['passk_bootstrap_count_multiplicity']} "
+        f"norm_std={algo['passk_norm_by_std']} adv_scale={algo['passk_adv_scale_factor']} "
+        f"debug_assert_full_group={algo['passk_debug_assert_full_group']}"
+    )
+
+
 def config_train_local_qwen05() -> Dict[str, Any]:
     """Train with local Qwen2.5-Coder-0.5B-Instruct weights (configurable via file/env)."""
 
@@ -428,6 +503,59 @@ def main() -> None:
         choices=["fast", "local_qwen05", "qwen", "llama", "npu"],
         help="Training configuration: 'fast' (CI testing), 'local_qwen05' (local 0.5B), 'qwen' (Qwen-2.5-Coder-1.5B), 'llama' (LLaMA-3.2-3B),'npu' (Train with NPU)",
     )
+    parser.add_argument(
+        "--stage",
+        type=int,
+        choices=[1, 2],
+        default=1,
+        help="Two-stage curriculum: stage1 optimizes Pass@k (k>1); stage2 tightens to Pass@1.",
+    )
+    parser.add_argument("--passk-k", type=int, default=None, help="Override Pass@k group size.")
+    parser.add_argument(
+        "--passk-mode",
+        choices=["analytic", "bootstrap"],
+        default=None,
+        help="Pass@k advantage mode. If unset, stage1 keeps current config default; stage2 forces analytic.",
+    )
+    parser.add_argument(
+        "--passk-bootstrap-B",
+        type=int,
+        default=None,
+        help="Bootstrap sample count B for Pass@k bootstrap mode.",
+    )
+    parser.add_argument(
+        "--passk-bootstrap-without-replacement",
+        action="store_true",
+        help="Sample Pass@k groups without replacement during bootstrap.",
+    )
+    parser.add_argument(
+        "--passk-bootstrap-unique",
+        action="store_true",
+        help="When True, each sampled group contributes once per response (ignore multiplicity).",
+    )
+    parser.add_argument(
+        "--passk-adv-scale-factor",
+        type=float,
+        default=None,
+        help="Scale Pass@k advantages to counteract shrinking magnitude at large k (default: 1.0).",
+    )
+    parser.add_argument(
+        "--no-passk-std-norm",
+        action="store_true",
+        help="Disable std normalization in Pass@k (Dr.GRPO-style, not recommended for k>1).",
+    )
+    parser.add_argument(
+        "--rollout-n",
+        type=int,
+        default=None,
+        help="Override actor_rollout_ref.rollout.n (number of rollouts per prompt). Stage1 will auto-bump to >=8 if unset.",
+    )
+    parser.add_argument(
+        "--resume-ckpt",
+        type=str,
+        default=None,
+        help="Resume from a checkpoint (useful for stage2 after saving stage1).",
+    )
 
     parser.add_argument(
         "--active-agent", type=str, help="Override the active agent name (default: auto-generated based on config)"
@@ -461,6 +589,7 @@ def main() -> None:
         run_label = Path(args.config_file).stem
     else:
         config = config_functions[args.config]()
+    _apply_passk_overrides(config, args)
     run_dir = prepare_run_outputs(config, run_label)
 
     # Set active agent - use provided value or default based on config choice
