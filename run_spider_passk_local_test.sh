@@ -5,13 +5,14 @@
 #############################################
 # 可直接修改的硬编码参数
 #############################################
-export PYTHONPATH=/root/verl_pass/verl:$PYTHONPATH
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH=$SCRIPT_DIR:/root/verl_pass/verl:$PYTHONPATH
 STAGE=1                                # 1=Pass@k 探索；2=Pass@1 收敛
 CUDA_VISIBLE_DEVICES="0"               # 选择要用的 GPU（如多卡可写成 "0,1"）
-CONFIG_STAGE1="configs/passk_stage1_qwen05b.json"  # 相对 SPIDER_DIR
+CONFIG_STAGE1="configs/passk_stage1_qwen05b_test.json"  # 相对 SPIDER_DIR
 CONFIG_STAGE2="configs/passk_stage2_qwen05b.json"  # 相对 SPIDER_DIR
 RESUME_CKPT=""                         # 如需从 stage1 恢复，填入 ckpt 路径；为空则不恢复
-AGL_SERVER_PORT="${AGL_SERVER_PORT:-4750}"
+AGL_SERVER_PORT="${AGL_SERVER_PORT:-4789}"
 #############################################
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,6 +20,7 @@ SPIDER_DIR="$SCRIPT_DIR/examples/spider"
 cd "$SPIDER_DIR"
 
 export VERL_SPIDER_DATA_DIR="$SPIDER_DIR/data"
+
 # 启动前检查和清理
 echo "=== 启动前检查和清理 ==="
 echo "检查是否有残留的进程和端口占用..."

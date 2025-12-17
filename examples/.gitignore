@@ -15,3 +15,4 @@ tinker/crewai_*.html
 rag/dataset_tiny.parquet
 rag/chunks_candidate_tiny.pkl
 rag/index_hnsw_faiss_n32e40_tiny.index
+examples/spider/log/

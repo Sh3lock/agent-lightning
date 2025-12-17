@@ -693,6 +693,9 @@ class AgentModeDaemon:
                     f"val/{data_source}/n_rollouts_w_reward": len(
                         [stat for stat in sample_stats if stat["has_reward"]]
                     ),
+                    f"val/{data_source}/n_success": len(
+                        [stat for stat in sample_stats if stat["reward"] == 1.0]
+                    ),
                     f"val/{data_source}/reward": np.mean(
                         [stat["reward"] for stat in sample_stats]
                     ),  # each rollout must have a reward (fillna if missing)
@@ -712,6 +715,7 @@ class AgentModeDaemon:
                 "val/n_rollouts": len(sample_stat_list),
                 "val/n_rollouts_w_trace": len(stats_w_trace),
                 "val/n_rollouts_w_reward": len([stat for stat in sample_stat_list if stat["has_reward"]]),
+                "val/n_success": len([stat for stat in sample_stat_list if stat["reward"] == 1.0]),
                 "val/reward": np.mean(
                     [stat["reward"] for stat in sample_stat_list]
                 ),  # each rollout must have a reward (fillna if missing)

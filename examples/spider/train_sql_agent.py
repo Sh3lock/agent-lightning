@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import platform
+import signal
 import subprocess
 import threading
 import time
@@ -39,6 +40,49 @@ import pandas as pd
 from sql_agent import LitSQLAgent
 
 import agentlightning as agl
+print(f"[DEBUG] agentlightning imported from: {agl.__file__}")
+
+# 全局变量用于优雅关闭
+shutdown_flag = False
+pid_file_path = "/tmp/spider_train_pid.txt"
+
+
+def signal_handler(signum, frame):
+    """信号处理器，用于优雅关闭"""
+    global shutdown_flag
+    print(f"\n收到信号 {signum}，开始优雅关闭...")
+    shutdown_flag = True
+    
+    # 删除PID文件
+    try:
+        if os.path.exists(pid_file_path):
+            os.remove(pid_file_path)
+    except Exception as e:
+        print(f"删除PID文件时出错: {e}")
+
+
+def setup_signal_handlers():
+    """设置信号处理器"""
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    print("已设置信号处理器用于优雅关闭")
+
+
+def write_pid_file():
+    """写入PID文件"""
+    try:
+        with open(pid_file_path, 'w') as f:
+            f.write(str(os.getpid()))
+        print(f"PID文件已创建: {pid_file_path} (PID: {os.getpid()})")
+    except Exception as e:
+        print(f"创建PID文件时出错: {e}")
+
+
+def check_shutdown_flag():
+    """检查关闭标志，如果设置则抛出异常"""
+    global shutdown_flag
+    if shutdown_flag:
+        raise KeyboardInterrupt("接收到关闭信号，正在优雅退出...")
 RL_TRAINING_CONFIG: Dict[str, Any] = {
     "algorithm": {
         # Default to Pass@k-aware estimator; CLI can switch k/mode per training stage.
@@ -460,6 +504,9 @@ def prepare_run_outputs(config: Dict[str, Any], run_label: str) -> Path:
     progress_log = run_dir / "progress.txt"
     config_dump = run_dir / "config.json"
 
+    progress_log.touch(exist_ok=True)
+
+
     config["trainer"]["progress_log_file"] = str(progress_log)
     config["trainer"]["sequence_log_file"] = str(run_dir / "sequence_lengths.csv")
     # Make sure summary lines are emitted regularly and captured by progress_log_file.
@@ -481,14 +528,25 @@ def prepare_run_outputs(config: Dict[str, Any], run_label: str) -> Path:
 
 def train(config: Dict[str, Any], active_agent: Optional[str]) -> None:
     """Train the SQL agent with the given configuration."""
+    
+    # 设置信号处理器和写入PID文件
+    setup_signal_handlers()
+    write_pid_file()
 
     agent = LitSQLAgent()
     algorithm = agl.VERL(config)
     trainer = agl.Trainer(n_runners=10, algorithm=algorithm, adapter={"agent_match": active_agent})
     print("Adapter agent match acknowledged:", trainer.adapter.agent_match)  # type: ignore
 
+    # 检查关闭标志
+    check_shutdown_flag()
+    
     train_data = pd.read_parquet(config["data"]["train_files"]).to_dict(orient="records")  # type: ignore
     val_data = pd.read_parquet(config["data"]["val_files"]).to_dict(orient="records")  # type: ignore
+    
+    # 检查关闭标志
+    check_shutdown_flag()
+    
     trainer.fit(agent, train_dataset=train_data, val_dataset=val_data)  # type: ignore
 
 

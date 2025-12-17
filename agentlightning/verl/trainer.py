@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import random
 import time
+import os
+import json
 from contextlib import contextmanager
+from collections import deque
 from copy import deepcopy
 from datetime import datetime
 from pprint import pprint
@@ -212,6 +215,12 @@ class AgentLightningTrainer(RayPPOTrainer):
                         )
             except Exception:
                 self._sequence_log_file = None
+        
+        self._progress_log_file = getattr(self.config.trainer, "progress_log_file", None)
+        print(f"[AgentLightningTrainer] progress_log_file: {self._progress_log_file}")
+        
+        self._log_interval = getattr(self.config.trainer, "log_interval", 1)
+        self._log_window = deque(maxlen=self._log_interval)
 
     def _validate(self):
         assert len(self.val_dataloader) == 1, "Please set val_batch_size to None for better throughput."
@@ -267,9 +276,23 @@ class AgentLightningTrainer(RayPPOTrainer):
 
         if not val_metrics:
             return "val_reward", None
+        
+        # Priority 1: val-core metrics
         preferred_keys = [k for k in val_metrics if k.startswith("val-core/")]
+        if preferred_keys:
+            return preferred_keys[0], val_metrics.get(preferred_keys[0])
+            
+        # Priority 2: val/reward (most important for RL)
+        if "val/reward" in val_metrics:
+            return "val/reward", val_metrics.get("val/reward")
+            
+        # Priority 3: val-aux metrics
         fallback_keys = [k for k in val_metrics if k.startswith("val-aux/")]
-        candidate_keys = preferred_keys or fallback_keys or list(val_metrics.keys())
+        if fallback_keys:
+            return fallback_keys[0], val_metrics.get(fallback_keys[0])
+            
+        # Priority 4: any other key
+        candidate_keys = list(val_metrics.keys())
         key = candidate_keys[0]
         return key, val_metrics.get(key)
 
@@ -297,6 +320,23 @@ class AgentLightningTrainer(RayPPOTrainer):
                     f"{response_mean},{response_p50},{response_p95},{response_max}\n"
                 )
         except Exception:
+            return
+
+    def _progress_log(self, message: str) -> None:
+        """Write progress messages to the progress log file."""
+        # Always print to stdout for debugging
+        print(f"[ProgressLog] {message}")
+        
+        if not self._progress_log_file:
+            print("[ProgressLog] Warning: No progress_log_file configured")
+            return
+        
+        try:
+            with open(self._progress_log_file, "a", encoding="utf-8") as f:
+                f.write(message + "\n")
+                f.flush()  # Ensure immediate write
+        except Exception as e:
+            print(f"[AgentLightningTrainer] Failed to write to progress log: {e}")
             return
 
     def _train_step(self, batch_dict: dict) -> dict:
@@ -534,6 +574,13 @@ class AgentLightningTrainer(RayPPOTrainer):
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
+        
+        # Force a test write to progress log
+        self._progress_log(f"Training started at {datetime.now()}. Global steps: {self.global_steps}")
+        print(f"[Debug] val_reward_fn: {self.val_reward_fn is not None}")
+        print(f"[Debug] test_freq: {self.config.trainer.test_freq}")
+        print(f"[Debug] log_interval: {self._log_interval}")
+
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
@@ -562,11 +609,13 @@ class AgentLightningTrainer(RayPPOTrainer):
                 metrics = self._train_step(batch_dict)
 
                 # validate
-                if (
+                should_validate = (
                     self.val_reward_fn is not None
                     and self.config.trainer.test_freq > 0
                     and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
-                ):
+                )
+                
+                if should_validate:
                     with _timer("validate", timing_raw):
                         val_metrics: dict = self._validate()
                         if is_last_step:
@@ -575,9 +624,16 @@ class AgentLightningTrainer(RayPPOTrainer):
                     # write validation summary to progress log
                     ts_val = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     key, val = self._select_val_metric(val_metrics)
-                    self._progress_log(
-                        f"[{ts_val}] [val] step {self.global_steps}/{self.total_training_steps} | {key}={val}"
-                    )
+                    
+                    log_msg = f"[{ts_val}] [val] step {self.global_steps}/{self.total_training_steps} | {key}={val}"
+                    if "val/n_success" in val_metrics:
+                        log_msg += f" | success={val_metrics['val/n_success']}"
+                    
+                    self._progress_log(log_msg)
+                    # Also log all validation metrics for debugging/completeness
+                    self._progress_log(f"[{ts_val}] [val-full] {json.dumps(val_metrics)}")
+                elif self.global_steps % 10 == 0: # Debug print every 10 steps if not validating
+                     print(f"[Debug] Skipping validation. Step: {self.global_steps}, test_freq: {self.config.trainer.test_freq}, val_reward_fn: {self.val_reward_fn is not None}")
 
                 if self.config.trainer.save_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.save_freq == 0
