@@ -1,0 +1,967 @@
+diff --git a/.gitignore b/.gitignore
+index 1e82687..4a87fcc 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -32,7 +32,7 @@ share/python-wheels/
+ .installed.cfg
+ *.egg
+ MANIFEST
+-
++examples/spider/log
+ # PyInstaller
+ #  Usually these files are written by a python script from a template
+ #  before PyInstaller builds the exe, so as to inject date/other infos into it.
+diff --git a/agentlightning/verl/daemon.py b/agentlightning/verl/daemon.py
+index 8a1950b..9a76958 100644
+--- a/agentlightning/verl/daemon.py
++++ b/agentlightning/verl/daemon.py
+@@ -693,6 +693,9 @@ class AgentModeDaemon:
+                     f"val/{data_source}/n_rollouts_w_reward": len(
+                         [stat for stat in sample_stats if stat["has_reward"]]
+                     ),
++                    f"val/{data_source}/n_success": len(
++                        [stat for stat in sample_stats if stat["reward"] == 1.0]
++                    ),
+                     f"val/{data_source}/reward": np.mean(
+                         [stat["reward"] for stat in sample_stats]
+                     ),  # each rollout must have a reward (fillna if missing)
+@@ -712,6 +715,7 @@ class AgentModeDaemon:
+                 "val/n_rollouts": len(sample_stat_list),
+                 "val/n_rollouts_w_trace": len(stats_w_trace),
+                 "val/n_rollouts_w_reward": len([stat for stat in sample_stat_list if stat["has_reward"]]),
++                "val/n_success": len([stat for stat in sample_stat_list if stat["reward"] == 1.0]),
+                 "val/reward": np.mean(
+                     [stat["reward"] for stat in sample_stat_list]
+                 ),  # each rollout must have a reward (fillna if missing)
+diff --git a/agentlightning/verl/trainer.py b/agentlightning/verl/trainer.py
+index 667b73a..7b83809 100644
+--- a/agentlightning/verl/trainer.py
++++ b/agentlightning/verl/trainer.py
+@@ -6,7 +6,10 @@ from __future__ import annotations
+ 
+ import random
+ import time
++import os
++import json
+ from contextlib import contextmanager
++from collections import deque
+ from copy import deepcopy
+ from datetime import datetime
+ from pprint import pprint
+@@ -212,6 +215,12 @@ class AgentLightningTrainer(RayPPOTrainer):
+                         )
+             except Exception:
+                 self._sequence_log_file = None
++        
++        self._progress_log_file = getattr(self.config.trainer, "progress_log_file", None)
++        print(f"[AgentLightningTrainer] progress_log_file: {self._progress_log_file}")
++        
++        self._log_interval = getattr(self.config.trainer, "log_interval", 1)
++        self._log_window = deque(maxlen=self._log_interval)
+ 
+     def _validate(self):
+         assert len(self.val_dataloader) == 1, "Please set val_batch_size to None for better throughput."
+@@ -267,9 +276,23 @@ class AgentLightningTrainer(RayPPOTrainer):
+ 
+         if not val_metrics:
+             return "val_reward", None
++        
++        # Priority 1: val-core metrics
+         preferred_keys = [k for k in val_metrics if k.startswith("val-core/")]
++        if preferred_keys:
++            return preferred_keys[0], val_metrics.get(preferred_keys[0])
++            
++        # Priority 2: val/reward (most important for RL)
++        if "val/reward" in val_metrics:
++            return "val/reward", val_metrics.get("val/reward")
++            
++        # Priority 3: val-aux metrics
+         fallback_keys = [k for k in val_metrics if k.startswith("val-aux/")]
+-        candidate_keys = preferred_keys or fallback_keys or list(val_metrics.keys())
++        if fallback_keys:
++            return fallback_keys[0], val_metrics.get(fallback_keys[0])
++            
++        # Priority 4: any other key
++        candidate_keys = list(val_metrics.keys())
+         key = candidate_keys[0]
+         return key, val_metrics.get(key)
+ 
+@@ -299,6 +322,23 @@ class AgentLightningTrainer(RayPPOTrainer):
+         except Exception:
+             return
+ 
++    def _progress_log(self, message: str) -> None:
++        """Write progress messages to the progress log file."""
++        # Always print to stdout for debugging
++        print(f"[ProgressLog] {message}")
++        
++        if not self._progress_log_file:
++            print("[ProgressLog] Warning: No progress_log_file configured")
++            return
++        
++        try:
++            with open(self._progress_log_file, "a", encoding="utf-8") as f:
++                f.write(message + "\n")
++                f.flush()  # Ensure immediate write
++        except Exception as e:
++            print(f"[AgentLightningTrainer] Failed to write to progress log: {e}")
++            return
++
+     def _train_step(self, batch_dict: dict) -> dict:
+         # Isolate in a separate method to automatically recycle the variables before validation.
+         batch: DataProto = DataProto.from_single_dict(batch_dict)
+@@ -534,6 +574,13 @@ class AgentLightningTrainer(RayPPOTrainer):
+ 
+         # perform validation before training
+         # currently, we only support validation using the reward_function.
++        
++        # Force a test write to progress log
++        self._progress_log(f"Training started at {datetime.now()}. Global steps: {self.global_steps}")
++        print(f"[Debug] val_reward_fn: {self.val_reward_fn is not None}")
++        print(f"[Debug] test_freq: {self.config.trainer.test_freq}")
++        print(f"[Debug] log_interval: {self._log_interval}")
++
+         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+             val_metrics = self._validate()
+             assert val_metrics, f"{val_metrics=}"
+@@ -562,11 +609,13 @@ class AgentLightningTrainer(RayPPOTrainer):
+                 metrics = self._train_step(batch_dict)
+ 
+                 # validate
+-                if (
++                should_validate = (
+                     self.val_reward_fn is not None
+                     and self.config.trainer.test_freq > 0
+                     and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+-                ):
++                )
++                
++                if should_validate:
+                     with _timer("validate", timing_raw):
+                         val_metrics: dict = self._validate()
+                         if is_last_step:
+@@ -575,9 +624,16 @@ class AgentLightningTrainer(RayPPOTrainer):
+                     # write validation summary to progress log
+                     ts_val = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                     key, val = self._select_val_metric(val_metrics)
+-                    self._progress_log(
+-                        f"[{ts_val}] [val] step {self.global_steps}/{self.total_training_steps} | {key}={val}"
+-                    )
++                    
++                    log_msg = f"[{ts_val}] [val] step {self.global_steps}/{self.total_training_steps} | {key}={val}"
++                    if "val/n_success" in val_metrics:
++                        log_msg += f" | success={val_metrics['val/n_success']}"
++                    
++                    self._progress_log(log_msg)
++                    # Also log all validation metrics for debugging/completeness
++                    self._progress_log(f"[{ts_val}] [val-full] {json.dumps(val_metrics)}")
++                elif self.global_steps % 10 == 0: # Debug print every 10 steps if not validating
++                     print(f"[Debug] Skipping validation. Step: {self.global_steps}, test_freq: {self.config.trainer.test_freq}, val_reward_fn: {self.val_reward_fn is not None}")
+ 
+                 if self.config.trainer.save_freq > 0 and (
+                     is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+diff --git a/examples/.gitignore b/examples/.gitignore
+index 05d49e8..678215a 100644
+--- a/examples/.gitignore
++++ b/examples/.gitignore
+@@ -15,3 +15,4 @@ tinker/crewai_*.html
+ rag/dataset_tiny.parquet
+ rag/chunks_candidate_tiny.pkl
+ rag/index_hnsw_faiss_n32e40_tiny.index
++examples/spider/log/
+diff --git a/examples/spider/configs/passk_stage1_qwen05b.json b/examples/spider/configs/passk_stage1_qwen05b.json
+index 169a53d..d46252b 100644
+--- a/examples/spider/configs/passk_stage1_qwen05b.json
++++ b/examples/spider/configs/passk_stage1_qwen05b.json
+@@ -8,13 +8,13 @@
+     "passk_bootstrap_count_multiplicity": true,
+     "passk_norm_by_std": true,
+     "passk_adv_scale_factor": 1.0,
+-    "passk_debug_assert_full_group": true,
++    "passk_debug_assert_full_group": false,
+     "use_kl_in_reward": false
+   },
+   "data": {
+     "train_files": "data/train_spider.parquet",
+     "val_files": "data/test_dev.parquet",
+-    "train_batch_size": 16,
++    "train_batch_size": 48,
+     "max_prompt_length": 4096,
+     "max_response_length": 2048,
+     "truncation": "error"
+@@ -23,10 +23,10 @@
+     "rollout": {
+       "tensor_model_parallel_size": 1,
+       "n": 16,
+-      "log_prob_micro_batch_size_per_gpu": 2,
++      "log_prob_micro_batch_size_per_gpu": 48,
+       "multi_turn": { "format": "hermes" },
+       "name": "vllm",
+-      "gpu_memory_utilization": 0.5,
++      "gpu_memory_utilization": 0.6,
+       "engine_kwargs": {
+         "vllm": {
+           "enable_auto_tool_choice": true,
+@@ -35,8 +35,8 @@
+       }
+     },
+     "actor": {
+-      "ppo_mini_batch_size": 16,
+-      "ppo_micro_batch_size_per_gpu": 1,
++      "ppo_mini_batch_size": 48,
++      "ppo_micro_batch_size_per_gpu": 6,
+       "optim": { "lr": 2e-6 },
+       "use_kl_loss": false,
+       "kl_loss_coef": 0.0,
+@@ -45,20 +45,19 @@
+       "clip_ratio_high": 0.3,
+       "fsdp_config": {
+         "param_offload": false,
+-        "optimizer_offload": true
++        "optimizer_offload": false
+       }
+     },
+     "ref": {
+-      "log_prob_micro_batch_size_per_gpu": 2,
+-      "fsdp_config": { "param_offload": true }
++      "log_prob_micro_batch_size_per_gpu": 48,
++      "fsdp_config": { "param_offload": false }
+     },
+     "model": {
+-      "path": "/home/lthpc/student/LiTengfei/LLaMA-Factory/models/Qwen2.5-Coder-0.5B-Instruct",
++      "path": "/root/autodl-tmp/Qwen2.5-Coder-0.5B-Instruct",
+       "use_remove_padding": true,
+-      "enable_gradient_checkpointing": true,
+-      "attn_implementation": "sdpa"
++      "enable_gradient_checkpointing": true
+     }
+-  },
++  },  
+   "trainer": {
+     "n_gpus_per_node": 1,
+     "val_before_train": false,
+@@ -67,10 +66,10 @@
+     "project_name": "AgentLightning",
+     "experiment_name": "spider_passk_stage1",
+     "nnodes": 1,
+-    "test_freq": 1,
++    "test_freq": 5,
+     "total_epochs": 1,
+     "log_interval": 1,
+-    "save_freq": 60,
+-    "default_local_dir": "/home/lthpc/student/LiTengfei/project/verl_pass/agent-lightning/examples/spider/ckpt_passk_stage1"
++    "save_freq": 15,
++    "default_local_dir": "/root/verl_pass/ckpt_passk_stage1"
+   }
+ }
+diff --git a/examples/spider/configs/passk_stage1_qwen05b_test.json b/examples/spider/configs/passk_stage1_qwen05b_test.json
+new file mode 100644
+index 0000000..f448d58
+--- /dev/null
++++ b/examples/spider/configs/passk_stage1_qwen05b_test.json
+@@ -0,0 +1,75 @@
++{
++  "algorithm": {
++    "adv_estimator": "grpo_passk_seed",
++    "passk_k": 2,
++    "passk_mode": "analytic",
++    "passk_bootstrap_B": 1024,
++    "passk_bootstrap_with_replacement": false,
++    "passk_bootstrap_count_multiplicity": true,
++    "passk_norm_by_std": true,
++    "passk_adv_scale_factor": 1.0,
++    "passk_debug_assert_full_group": false,
++    "use_kl_in_reward": false
++  },
++  "data": {
++    "train_files": "data/train_spider.parquet",
++    "val_files": "data/test_dev.parquet",
++    "train_batch_size": 2,
++    "max_prompt_length": 4096,
++    "max_response_length": 2048,
++    "truncation": "error"
++  },
++  "actor_rollout_ref": {
++    "rollout": {
++      "tensor_model_parallel_size": 1,
++      "n": 4,
++      "log_prob_micro_batch_size_per_gpu": 32,
++      "multi_turn": { "format": "hermes" },
++      "name": "vllm",
++      "gpu_memory_utilization": 0.5,
++      "engine_kwargs": {
++        "vllm": {
++          "enable_auto_tool_choice": true,
++          "tool_call_parser": "hermes"
++        }
++      }
++    },
++    "actor": {
++      "ppo_mini_batch_size": 2,
++      "ppo_micro_batch_size_per_gpu": 8,
++      "optim": { "lr": 2e-6 },
++      "use_kl_loss": false,
++      "kl_loss_coef": 0.0,
++      "entropy_coeff": 0,
++      "clip_ratio_low": 0.2,
++      "clip_ratio_high": 0.3,
++      "fsdp_config": {
++        "param_offload": false,
++        "optimizer_offload": false
++      }
++    },
++    "ref": {
++      "log_prob_micro_batch_size_per_gpu": 32,
++      "fsdp_config": { "param_offload": false }
++    },
++    "model": {
++      "path": "/root/Qwen2.5-Coder-0.5B-Instruct",
++      "use_remove_padding": true,
++      "enable_gradient_checkpointing": true
++    }
++  },  
++  "trainer": {
++    "n_gpus_per_node": 1,
++    "val_before_train": false,
++    "critic_warmup": 0,
++    "logger": ["console", "wandb"],
++    "project_name": "AgentLightning",
++    "experiment_name": "spider_passk_stage1",
++    "nnodes": 1,
++    "test_freq": 1,
++    "total_epochs": 1,
++    "log_interval": 1,
++    "save_freq": 1,
++    "default_local_dir": "/root/autodl-tmp/ckpt_passk_stage1"
++  }
++}
+diff --git a/examples/spider/configs/passk_stage2_qwen05b.json b/examples/spider/configs/passk_stage2_qwen05b.json
+index 8bbddc9..6fbb7f7 100644
+--- a/examples/spider/configs/passk_stage2_qwen05b.json
++++ b/examples/spider/configs/passk_stage2_qwen05b.json
+@@ -53,7 +53,7 @@
+       "fsdp_config": { "param_offload": true }
+     },
+     "model": {
+-      "path": "/home/lthpc/student/LiTengfei/LLaMA-Factory/models/Qwen2.5-Coder-0.5B-Instruct",
++      "path": "/root/autodl-tmp/Qwen2.5-Coder-0.5B-Instruct",
+       "use_remove_padding": true,
+       "enable_gradient_checkpointing": true,
+       "attn_implementation": "sdpa"
+@@ -71,6 +71,6 @@
+     "total_epochs": 1,
+     "log_interval": 1,
+     "save_freq": 500,
+-    "default_local_dir": "/home/lthpc/student/LiTengfei/project/verl_pass/agent-lightning/examples/spider/ckpt_passk_stage2"
++    "default_local_dir": "/root/autodl-tmp/ckpt_passk_stage2"
+   }
+ }
+diff --git a/examples/spider/configs/reproduce_oom.json b/examples/spider/configs/reproduce_oom.json
+new file mode 100644
+index 0000000..33b2eeb
+--- /dev/null
++++ b/examples/spider/configs/reproduce_oom.json
+@@ -0,0 +1,83 @@
++{
++  "algorithm": {
++    "adv_estimator": "grpo_passk_seed",
++    "passk_k": 4,
++    "passk_mode": "analytic",
++    "passk_bootstrap_B": 1024,
++    "passk_bootstrap_with_replacement": false,
++    "passk_bootstrap_count_multiplicity": true,
++    "passk_norm_by_std": true,
++    "passk_adv_scale_factor": 1.0,
++    "passk_debug_assert_full_group": false,
++    "use_kl_in_reward": false
++  },
++  "data": {
++    "train_files": "data/reproduce_oom.parquet",
++    "val_files": "data/test_dev.parquet",
++    "train_batch_size": 48,
++    "max_prompt_length": 4096,
++    "max_response_length": 2048,
++    "truncation": "error"
++  },
++  "actor_rollout_ref": {
++    "rollout": {
++      "tensor_model_parallel_size": 1,
++      "n": 24,
++      "log_prob_micro_batch_size_per_gpu": 48,
++      "multi_turn": {
++        "format": "hermes"
++      },
++      "name": "vllm",
++      "gpu_memory_utilization": 0.6,
++      "engine_kwargs": {
++        "vllm": {
++          "enable_auto_tool_choice": true,
++          "tool_call_parser": "hermes"
++        }
++      }
++    },
++    "actor": {
++      "ppo_mini_batch_size": 48,
++      "ppo_micro_batch_size_per_gpu": 6,
++      "optim": {
++        "lr": 2e-06
++      },
++      "use_kl_loss": false,
++      "kl_loss_coef": 0.0,
++      "entropy_coeff": 0,
++      "clip_ratio_low": 0.2,
++      "clip_ratio_high": 0.3,
++      "fsdp_config": {
++        "param_offload": false,
++        "optimizer_offload": false
++      }
++    },
++    "ref": {
++      "log_prob_micro_batch_size_per_gpu": 48,
++      "fsdp_config": {
++        "param_offload": false
++      }
++    },
++    "model": {
++      "path": "/root/autodl-tmp/Qwen2.5-Coder-0.5B-Instruct",
++      "use_remove_padding": true,
++      "enable_gradient_checkpointing": true
++    }
++  },
++  "trainer": {
++    "n_gpus_per_node": 1,
++    "val_before_train": false,
++    "critic_warmup": 0,
++    "logger": ["console", "wandb"],
++    "project_name": "AgentLightning",
++    "experiment_name": "reproduce_oom",
++    "nnodes": 1,
++    "test_freq": 5,
++    "total_epochs": 1,
++    "log_interval": 1,
++    "save_freq": 10,
++    "default_local_dir": "/root/autodl-tmp/ckpt_reproduce_oom"
++  }
++}
++
++
+diff --git a/examples/spider/find_longest_prompts.py b/examples/spider/find_longest_prompts.py
+new file mode 100644
+index 0000000..d7728b8
+--- /dev/null
++++ b/examples/spider/find_longest_prompts.py
+@@ -0,0 +1,85 @@
++import pandas as pd
++import os
++from langchain_community.utilities import SQLDatabase
++from tqdm import tqdm
++
++# Path setup
++BASE_DIR = '/root/verl_pass/agent-lightning/examples/spider'
++DATA_DIR = os.path.join(BASE_DIR, 'data')
++DB_DIR = os.path.join(DATA_DIR, 'database')
++PARQUET_FILE = os.path.join(DATA_DIR, 'train_spider.parquet')
++
++# Prompt template (simplified for length estimation)
++SYSTEM_PROMPT = """
++You are an agent designed to interact with a SQL database.
++     Given an input question, create a syntactically correct {dialect} query to run to help find the answer.
++
++Pay attention to use only the column names that you can see in the schema description.
++Be careful to not query for columns that do not exist.
++Also, pay attention to which column is in which table.
++
++## Table Schema ##
++
++Only use the following tables:
++{table_info}
++
++## Output Format ##
++
++Respond in the following format:
++
++```{dialect}
++GENERATED QUERY
++```
++"""
++
++USER_PROMPT = "Question: {input}"
++
++def get_prompt_length(row):
++    db_id = row['db_id']
++    question = row['question']
++    
++    db_path = os.path.join(DB_DIR, db_id, f"{db_id}.sqlite")
++    uri = f"sqlite:///{db_path}"
++    
++    try:
++        db = SQLDatabase.from_uri(uri)
++        table_info = db.get_table_info()
++        
++        # Construct full prompt string
++        system_part = SYSTEM_PROMPT.format(dialect="sqlite", table_info=table_info)
++        user_part = USER_PROMPT.format(input=question)
++        
++        full_text = system_part + "\n" + user_part
++        return len(full_text)
++    except Exception as e:
++        print(f"Error processing {db_id}: {e}")
++        return 0
++
++def main():
++    print("Loading data...")
++    df = pd.read_parquet(PARQUET_FILE)
++    print(f"Loaded {len(df)} rows.")
++    
++    lengths = []
++    print("Calculating lengths...")
++    for idx, row in tqdm(df.iterrows(), total=len(df)):
++        length = get_prompt_length(row)
++        lengths.append(length)
++    
++    df['prompt_length'] = lengths
++    
++    # Sort by length descending
++    df_sorted = df.sort_values('prompt_length', ascending=False)
++    
++    # Take top 48
++    top_48 = df_sorted.head(48)
++    
++    print("Top 5 lengths (chars):")
++    print(top_48['prompt_length'].head().values)
++    
++    output_file = os.path.join(DATA_DIR, 'reproduce_oom.parquet')
++    top_48.to_parquet(output_file)
++    print(f"Saved top 48 longest examples to {output_file}")
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/spider/inspect_data.py b/examples/spider/inspect_data.py
+new file mode 100644
+index 0000000..740ac2e
+--- /dev/null
++++ b/examples/spider/inspect_data.py
+@@ -0,0 +1,8 @@
++import pandas as pd
++
++try:
++    df = pd.read_parquet('/root/verl_pass/agent-lightning/examples/spider/data/train_spider.parquet')
++    print(df.columns)
++    print(df.iloc[0])
++except Exception as e:
++    print(e)
+diff --git a/examples/spider/prepare_oom_data.py b/examples/spider/prepare_oom_data.py
+new file mode 100644
+index 0000000..aef0ddd
+--- /dev/null
++++ b/examples/spider/prepare_oom_data.py
+@@ -0,0 +1,55 @@
++import pandas as pd
++from langchain_community.utilities import SQLDatabase
++import os
++
++# Path to data
++DATA_DIR = "/root/verl_pass/agent-lightning/examples/spider/data"
++PARQUET_FILE = os.path.join(DATA_DIR, "train_spider.parquet")
++DB_DIR = os.path.join(DATA_DIR, "database")
++
++# Read parquet
++print(f"Reading {PARQUET_FILE}...")
++df = pd.read_parquet(PARQUET_FILE)
++
++# Function to get schema length
++def get_schema_length(db_id):
++    db_path = os.path.join(DB_DIR, db_id, f"{db_id}.sqlite")
++    uri = f"sqlite:///{db_path}"
++    try:
++        # We use include_tables=None to get all tables, which is the default behavior usually
++        db = SQLDatabase.from_uri(uri)
++        table_info = db.get_table_info()
++        return len(table_info)
++    except Exception as e:
++        print(f"Error reading {db_id}: {e}")
++        return 0
++
++# Add length column
++schema_lengths = {}
++unique_dbs = df['db_id'].unique()
++print(f"Found {len(unique_dbs)} unique databases. Calculating schema lengths...")
++
++for i, db_id in enumerate(unique_dbs):
++    if i % 10 == 0:
++        print(f"Processing {i}/{len(unique_dbs)}...", end='\r')
++    schema_lengths[db_id] = get_schema_length(db_id)
++print("\nDone calculating schema lengths.")
++
++df['schema_len'] = df['db_id'].map(schema_lengths)
++df['question_len'] = df['question'].str.len()
++# Approximate total length (characters). 
++# Note: Token count is roughly char count / 3 or 4, but relative order should be similar.
++df['total_len'] = df['schema_len'] + df['question_len']
++
++# Sort by total_len descending
++df_sorted = df.sort_values('total_len', ascending=False)
++
++# Take top 48
++df_top48 = df_sorted.head(48)
++
++# Save
++output_path = os.path.join(DATA_DIR, "reproduce_oom.parquet")
++df_top48.to_parquet(output_path)
++print(f"Saved top 48 longest sequences to {output_path}")
++print("Top 5 longest:")
++print(df_top48[['db_id', 'question', 'total_len']].head())
+diff --git a/examples/spider/reproduce_oom.sh b/examples/spider/reproduce_oom.sh
+new file mode 100755
+index 0000000..06964d7
+--- /dev/null
++++ b/examples/spider/reproduce_oom.sh
+@@ -0,0 +1,11 @@
++#!/bin/bash
++export PYTHONPATH=/root/verl_pass/verl:$PYTHONPATH
++cd /root/verl_pass/agent-lightning/examples/spider
++
++# Clean up previous runs
++echo "Cleaning up previous processes..."
++pkill -f train_sql_agent.py
++sleep 2
++
++echo "Starting OOM reproduction with top 48 longest sequences..."
++python train_sql_agent.py qwen --config-file configs/reproduce_oom.json
+diff --git a/examples/spider/train_sql_agent.py b/examples/spider/train_sql_agent.py
+index a75f577..af686ec 100644
+--- a/examples/spider/train_sql_agent.py
++++ b/examples/spider/train_sql_agent.py
+@@ -27,6 +27,7 @@ import argparse
+ import json
+ import os
+ import platform
++import signal
+ import subprocess
+ import threading
+ import time
+@@ -39,6 +40,49 @@ import pandas as pd
+ from sql_agent import LitSQLAgent
+ 
+ import agentlightning as agl
++print(f"[DEBUG] agentlightning imported from: {agl.__file__}")
++
++# 全局变量用于优雅关闭
++shutdown_flag = False
++pid_file_path = "/tmp/spider_train_pid.txt"
++
++
++def signal_handler(signum, frame):
++    """信号处理器，用于优雅关闭"""
++    global shutdown_flag
++    print(f"\n收到信号 {signum}，开始优雅关闭...")
++    shutdown_flag = True
++    
++    # 删除PID文件
++    try:
++        if os.path.exists(pid_file_path):
++            os.remove(pid_file_path)
++    except Exception as e:
++        print(f"删除PID文件时出错: {e}")
++
++
++def setup_signal_handlers():
++    """设置信号处理器"""
++    signal.signal(signal.SIGTERM, signal_handler)
++    signal.signal(signal.SIGINT, signal_handler)
++    print("已设置信号处理器用于优雅关闭")
++
++
++def write_pid_file():
++    """写入PID文件"""
++    try:
++        with open(pid_file_path, 'w') as f:
++            f.write(str(os.getpid()))
++        print(f"PID文件已创建: {pid_file_path} (PID: {os.getpid()})")
++    except Exception as e:
++        print(f"创建PID文件时出错: {e}")
++
++
++def check_shutdown_flag():
++    """检查关闭标志，如果设置则抛出异常"""
++    global shutdown_flag
++    if shutdown_flag:
++        raise KeyboardInterrupt("接收到关闭信号，正在优雅退出...")
+ RL_TRAINING_CONFIG: Dict[str, Any] = {
+     "algorithm": {
+         # Default to Pass@k-aware estimator; CLI can switch k/mode per training stage.
+@@ -460,6 +504,9 @@ def prepare_run_outputs(config: Dict[str, Any], run_label: str) -> Path:
+     progress_log = run_dir / "progress.txt"
+     config_dump = run_dir / "config.json"
+ 
++    progress_log.touch(exist_ok=True)
++
++
+     config["trainer"]["progress_log_file"] = str(progress_log)
+     config["trainer"]["sequence_log_file"] = str(run_dir / "sequence_lengths.csv")
+     # Make sure summary lines are emitted regularly and captured by progress_log_file.
+@@ -481,14 +528,25 @@ def prepare_run_outputs(config: Dict[str, Any], run_label: str) -> Path:
+ 
+ def train(config: Dict[str, Any], active_agent: Optional[str]) -> None:
+     """Train the SQL agent with the given configuration."""
++    
++    # 设置信号处理器和写入PID文件
++    setup_signal_handlers()
++    write_pid_file()
+ 
+     agent = LitSQLAgent()
+     algorithm = agl.VERL(config)
+     trainer = agl.Trainer(n_runners=10, algorithm=algorithm, adapter={"agent_match": active_agent})
+     print("Adapter agent match acknowledged:", trainer.adapter.agent_match)  # type: ignore
+ 
++    # 检查关闭标志
++    check_shutdown_flag()
++    
+     train_data = pd.read_parquet(config["data"]["train_files"]).to_dict(orient="records")  # type: ignore
+     val_data = pd.read_parquet(config["data"]["val_files"]).to_dict(orient="records")  # type: ignore
++    
++    # 检查关闭标志
++    check_shutdown_flag()
++    
+     trainer.fit(agent, train_dataset=train_data, val_dataset=val_data)  # type: ignore
+ 
+ 
+diff --git a/run.sh b/run.sh
+index 051afbd..34be0c4 100644
+--- a/run.sh
++++ b/run.sh
+@@ -1,6 +1,6 @@
+ export OPENAI_API_BASE="https://dashscope.aliyuncs.com/compatible-mode/v1"
+ export OPENAI_API_KEY="sk-44019fa179c244b182f1872177bdcf74"
+-export OPENAI_MODEL="qwen2.5-coder-1.5b-instruct"
++export OPENAI_MODEL="qwen2.5-coder-0.5b-instruct"
+ 
+ export DASHSCOPE_API_KEY="$OPENAI_API_KEY"
+ export VERL_SPIDER_DATA_DIR="examples/spider/data"
+@@ -8,5 +8,5 @@ export VERL_SPIDER_DATA_DIR="examples/spider/data"
+ python examples/spider/sql_agent_eval.py \
+   --mode eval \
+   --num-samples -1 \
+-  --output outputs/qwen2.5-coder-1.5b-instruct-local.jsonl \
++  --output outputs/qwen2.5-coder-0.5b-instruct-local.jsonl \
+   --concurrency 16
+\ No newline at end of file
+diff --git a/run_spider_passk_local.sh b/run_spider_passk_local.sh
+index c09f1f2..58a9427 100644
+--- a/run_spider_passk_local.sh
++++ b/run_spider_passk_local.sh
+@@ -1,19 +1,16 @@
+ #!/bin/bash
+ # 一键启动 Spider Pass@k 训练（Qwen2.5-Coder-0.5B，本地单机）
+-set -e
+ # 固定使用打好补丁的 venv Python
+-PYTHON_BIN="/home/lthpc/student/LiTengfei/env/light/bin/python"
+ 
+-# Python 搜索当前源码
+-export PYTHONPATH="$ROOT:$PYTHONPATH"
+ #############################################
+ # 可直接修改的硬编码参数
+ #############################################
++export PYTHONPATH=/root/verl_pass/verl:$PYTHONPATH
+ STAGE=1                                # 1=Pass@k 探索；2=Pass@1 收敛
+ CUDA_VISIBLE_DEVICES="0"               # 选择要用的 GPU（如多卡可写成 "0,1"）
+ CONFIG_STAGE1="configs/passk_stage1_qwen05b.json"  # 相对 SPIDER_DIR
+ CONFIG_STAGE2="configs/passk_stage2_qwen05b.json"  # 相对 SPIDER_DIR
+-RESUME_CKPT=""                         # 如需从 stage1 恢复，填入 ckpt 路径；为空则不恢复
++RESUME_CKPT="/root/autodl-tmp/ckpt_passk_stage1/global_step_15"                         # 如需从 stage1 恢复，填入 ckpt 路径；为空则不恢复
+ AGL_SERVER_PORT="${AGL_SERVER_PORT:-4750}"
+ #############################################
+ 
+@@ -21,13 +18,52 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ SPIDER_DIR="$SCRIPT_DIR/examples/spider"
+ cd "$SPIDER_DIR"
+ 
+-mkdir -p /home/lthpc/raytmp
+-export RAY_TMPDIR=/home/lthpc/raytmp
+ export VERL_SPIDER_DATA_DIR="$SPIDER_DIR/data"
+-export AGL_SERVER_PORT
+-# # 强制禁用 flash-attn，优先用 sdpa（或根据配置选 xformers）
+-# export TRANSFORMERS_ATTENTION_KERNEL=sdpa
+-# export PYTORCH_USE_FLASH_ATTENTION=0
++# 启动前检查和清理
++echo "=== 启动前检查和清理 ==="
++echo "检查是否有残留的进程和端口占用..."
++
++# 检查 Python 进程
++python_processes=$(ps aux | grep -E "(python|train_sql_agent)" | grep -v grep | grep -v run_spider_passk_local_test.sh)
++if [ ! -z "$python_processes" ]; then
++    echo "发现残留的 Python 进程："
++    echo "$python_processes"
++    echo "正在清理..."
++    
++    # 提取PID并终止进程
++    echo "$python_processes" | awk '{print $2}' | xargs -r kill -TERM
++    
++    # 等待进程优雅退出
++    sleep 3
++    
++    # 检查是否还有残留进程，强制终止
++    remaining_processes=$(ps aux | grep -E "(python|train_sql_agent)" | grep -v grep | grep -v run_spider_passk_local_test.sh)
++    if [ ! -z "$remaining_processes" ]; then
++        echo "强制终止残留进程..."
++        echo "$remaining_processes" | awk '{print $2}' | xargs -r kill -KILL
++    fi
++else
++    echo "未发现残留的 Python 进程"
++fi
++
++# 检查常见端口占用
++ports=(4789 8000 8001 8002 8080 8888)
++for port in "${ports[@]}"; do
++    port_process=$(netstat -tlnp 2>/dev/null | grep ":$port " | awk '{print $7}')
++    if [ ! -z "$port_process" ] && [ "$port_process" != "-" ]; then
++        echo "发现端口 $port 被占用: $port_process"
++        pid=$(echo "$port_process" | cut -d'/' -f1)
++        if [ ! -z "$pid" ]; then
++            echo "正在终止占用端口 $port 的进程 (PID: $pid)..."
++            kill -TERM "$pid" 2>/dev/null
++            sleep 1
++            kill -KILL "$pid" 2>/dev/null
++        fi
++    fi
++done
++
++echo "清理完成，等待2秒后启动..."
++sleep 1
+ 
+ if [[ "$STAGE" == "1" ]]; then
+   CONFIG_PATH="$CONFIG_STAGE1"
+@@ -68,7 +104,7 @@ LOG_FILE="$LOG_DIR/train_${CONFIG_STEM}_stage${STAGE}_${TS}.log"
+ # 可选：关闭 wandb
+ # export WANDB_DISABLED=true
+ 
+-CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" nohup "$PYTHON_BIN" train_sql_agent.py local_qwen05 \
++nohup python train_sql_agent.py local_qwen05 \
+   --config-file "$CONFIG_PATH" \
+   $STAGE_ARG \
+   $CKPT_ARG \
+diff --git a/run_spider_passk_local_test.sh b/run_spider_passk_local_test.sh
+new file mode 100644
+index 0000000..a2d76a3
+--- /dev/null
++++ b/run_spider_passk_local_test.sh
+@@ -0,0 +1,119 @@
++#!/bin/bash
++# 一键启动 Spider Pass@k 训练（Qwen2.5-Coder-0.5B，本地单机）
++# 固定使用打好补丁的 venv Python
++
++#############################################
++# 可直接修改的硬编码参数
++#############################################
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++export PYTHONPATH=$SCRIPT_DIR:/root/verl_pass/verl:$PYTHONPATH
++STAGE=1                                # 1=Pass@k 探索；2=Pass@1 收敛
++CUDA_VISIBLE_DEVICES="0"               # 选择要用的 GPU（如多卡可写成 "0,1"）
++CONFIG_STAGE1="configs/passk_stage1_qwen05b_test.json"  # 相对 SPIDER_DIR
++CONFIG_STAGE2="configs/passk_stage2_qwen05b.json"  # 相对 SPIDER_DIR
++RESUME_CKPT=""                         # 如需从 stage1 恢复，填入 ckpt 路径；为空则不恢复
++AGL_SERVER_PORT="${AGL_SERVER_PORT:-4789}"
++#############################################
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++SPIDER_DIR="$SCRIPT_DIR/examples/spider"
++cd "$SPIDER_DIR"
++
++export VERL_SPIDER_DATA_DIR="$SPIDER_DIR/data"
++
++# 启动前检查和清理
++echo "=== 启动前检查和清理 ==="
++echo "检查是否有残留的进程和端口占用..."
++
++# 检查 Python 进程
++python_processes=$(ps aux | grep -E "(python|train_sql_agent)" | grep -v grep | grep -v run_spider_passk_local_test.sh)
++if [ ! -z "$python_processes" ]; then
++    echo "发现残留的 Python 进程："
++    echo "$python_processes"
++    echo "正在清理..."
++    
++    # 提取PID并终止进程
++    echo "$python_processes" | awk '{print $2}' | xargs -r kill -TERM
++    
++    # 等待进程优雅退出
++    sleep 3
++    
++    # 检查是否还有残留进程，强制终止
++    remaining_processes=$(ps aux | grep -E "(python|train_sql_agent)" | grep -v grep | grep -v run_spider_passk_local_test.sh)
++    if [ ! -z "$remaining_processes" ]; then
++        echo "强制终止残留进程..."
++        echo "$remaining_processes" | awk '{print $2}' | xargs -r kill -KILL
++    fi
++else
++    echo "未发现残留的 Python 进程"
++fi
++
++# 检查常见端口占用
++ports=(4789 8000 8001 8002 8080 8888)
++for port in "${ports[@]}"; do
++    port_process=$(netstat -tlnp 2>/dev/null | grep ":$port " | awk '{print $7}')
++    if [ ! -z "$port_process" ] && [ "$port_process" != "-" ]; then
++        echo "发现端口 $port 被占用: $port_process"
++        pid=$(echo "$port_process" | cut -d'/' -f1)
++        if [ ! -z "$pid" ]; then
++            echo "正在终止占用端口 $port 的进程 (PID: $pid)..."
++            kill -TERM "$pid" 2>/dev/null
++            sleep 1
++            kill -KILL "$pid" 2>/dev/null
++        fi
++    fi
++done
++
++echo "清理完成，等待2秒后启动..."
++sleep 1
++
++if [[ "$STAGE" == "1" ]]; then
++  CONFIG_PATH="$CONFIG_STAGE1"
++  STAGE_ARG="--stage 1"
++  CKPT_ARG=""
++elif [[ "$STAGE" == "2" ]]; then
++  CONFIG_PATH="$CONFIG_STAGE2"
++  STAGE_ARG="--stage 2"
++  CKPT_ARG=""
++  if [[ -n "$RESUME_CKPT" ]]; then
++    CKPT_ARG="--resume-ckpt $RESUME_CKPT"
++  fi
++else
++  echo "Unknown STAGE=$STAGE (use 1 or 2)"
++  exit 1
++fi
++
++CONFIG_STEM="$(basename "$CONFIG_PATH" .json)"
++LOG_DIR="$SPIDER_DIR/log"
++mkdir -p "$LOG_DIR"
++TS="$(date +%Y%m%d_%H%M%S)"
++LOG_FILE="$LOG_DIR/train_${CONFIG_STEM}_stage${STAGE}_${TS}.log"
++
++{
++  echo "========================================"
++  echo "Training started at: $(date +"%Y-%m-%d %H:%M:%S")"
++  echo "Hostname: $(hostname)"
++  echo "User: $(whoami)"
++  echo "CWD: $(pwd)"
++  echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
++  echo "Python: $($PYTHON_BIN --version 2>&1)"
++  echo "Config: $CONFIG_PATH"
++  echo "Stage arg: $STAGE_ARG"
++  echo "Resume ckpt: ${RESUME_CKPT:-none}"
++  echo "========================================"
++} > "$LOG_FILE"
++
++# 可选：关闭 wandb
++# export WANDB_DISABLED=true
++
++nohup python train_sql_agent.py local_qwen05 \
++  --config-file "$CONFIG_PATH" \
++  $STAGE_ARG \
++  $CKPT_ARG \
++  >> "$LOG_FILE" 2>&1 &
++
++echo "Training started with PID $!"
++echo "Config: $CONFIG_PATH"
++echo "Log: $LOG_FILE"
++echo "Stage: $STAGE"
++echo "Resume ckpt: ${RESUME_CKPT:-none}"
