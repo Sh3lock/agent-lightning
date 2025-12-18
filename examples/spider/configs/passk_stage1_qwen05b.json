@@ -22,7 +22,7 @@
   "actor_rollout_ref": {
     "rollout": {
       "tensor_model_parallel_size": 1,
-      "n": 24,
+      "n": 16,
       "log_prob_micro_batch_size_per_gpu": 48,
       "multi_turn": { "format": "hermes" },
       "name": "vllm",
@@ -36,7 +36,7 @@
     },
     "actor": {
       "ppo_mini_batch_size": 48,
-      "ppo_micro_batch_size_per_gpu": 8,
+      "ppo_micro_batch_size_per_gpu": 6,
       "optim": { "lr": 2e-6 },
       "use_kl_loss": false,
       "kl_loss_coef": 0.0,
@@ -69,7 +69,7 @@
     "test_freq": 5,
     "total_epochs": 1,
     "log_interval": 1,
-    "save_freq": 20,
-    "default_local_dir": "/root/autodl-tmp/ckpt_passk_stage1"
+    "save_freq": 15,
+    "default_local_dir": "/root/verl_pass/ckpt_passk_stage1"
   }
 }

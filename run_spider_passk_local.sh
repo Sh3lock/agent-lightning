@@ -10,7 +10,7 @@ STAGE=1                                # 1=Pass@k 探索；2=Pass@1 收敛
 CUDA_VISIBLE_DEVICES="0"               # 选择要用的 GPU（如多卡可写成 "0,1"）
 CONFIG_STAGE1="configs/passk_stage1_qwen05b.json"  # 相对 SPIDER_DIR
 CONFIG_STAGE2="configs/passk_stage2_qwen05b.json"  # 相对 SPIDER_DIR
-RESUME_CKPT=""                         # 如需从 stage1 恢复，填入 ckpt 路径；为空则不恢复
+RESUME_CKPT="/root/autodl-tmp/ckpt_passk_stage1/global_step_15"                         # 如需从 stage1 恢复，填入 ckpt 路径；为空则不恢复
 AGL_SERVER_PORT="${AGL_SERVER_PORT:-4750}"
 #############################################
 

@@ -1,20 +1,20 @@
 {
   "algorithm": {
     "adv_estimator": "grpo_passk_seed",
-    "passk_k": 1,
+    "passk_k": 4,
     "passk_mode": "analytic",
-    "passk_bootstrap_B": 256,
+    "passk_bootstrap_B": 1024,
     "passk_bootstrap_with_replacement": false,
     "passk_bootstrap_count_multiplicity": true,
     "passk_norm_by_std": true,
     "passk_adv_scale_factor": 1.0,
-    "passk_debug_assert_full_group": true,
+    "passk_debug_assert_full_group": false,
     "use_kl_in_reward": false
   },
   "data": {
-    "train_files": "data/train_spider.parquet",
+    "train_files": "data/reproduce_oom.parquet",
     "val_files": "data/test_dev.parquet",
-    "train_batch_size": 8,
+    "train_batch_size": 48,
     "max_prompt_length": 4096,
     "max_response_length": 2048,
     "truncation": "error"
@@ -22,11 +22,13 @@
   "actor_rollout_ref": {
     "rollout": {
       "tensor_model_parallel_size": 1,
-      "n": 4,
-      "log_prob_micro_batch_size_per_gpu": 1,
-      "multi_turn": { "format": "hermes" },
+      "n": 24,
+      "log_prob_micro_batch_size_per_gpu": 48,
+      "multi_turn": {
+        "format": "hermes"
+      },
       "name": "vllm",
-      "gpu_memory_utilization": 0.5,
+      "gpu_memory_utilization": 0.6,
       "engine_kwargs": {
         "vllm": {
           "enable_auto_tool_choice": true,
@@ -35,9 +37,11 @@
       }
     },
     "actor": {
-      "ppo_mini_batch_size": 8,
-      "ppo_micro_batch_size_per_gpu": 1,
-      "optim": { "lr": 8e-7 },
+      "ppo_mini_batch_size": 48,
+      "ppo_micro_batch_size_per_gpu": 6,
+      "optim": {
+        "lr": 2e-06
+      },
       "use_kl_loss": false,
       "kl_loss_coef": 0.0,
       "entropy_coeff": 0,
@@ -45,18 +49,19 @@
       "clip_ratio_high": 0.3,
       "fsdp_config": {
         "param_offload": false,
-        "optimizer_offload": true
+        "optimizer_offload": false
       }
     },
     "ref": {
-      "log_prob_micro_batch_size_per_gpu": 1,
-      "fsdp_config": { "param_offload": true }
+      "log_prob_micro_batch_size_per_gpu": 48,
+      "fsdp_config": {
+        "param_offload": false
+      }
     },
     "model": {
       "path": "/root/autodl-tmp/Qwen2.5-Coder-0.5B-Instruct",
       "use_remove_padding": true,
-      "enable_gradient_checkpointing": true,
-      "attn_implementation": "sdpa"
+      "enable_gradient_checkpointing": true
     }
   },
   "trainer": {
@@ -65,12 +70,14 @@
     "critic_warmup": 0,
     "logger": ["console", "wandb"],
     "project_name": "AgentLightning",
-    "experiment_name": "spider_passk_stage2",
+    "experiment_name": "reproduce_oom",
     "nnodes": 1,
-    "test_freq": 500,
+    "test_freq": 5,
     "total_epochs": 1,
     "log_interval": 1,
-    "save_freq": 500,
-    "default_local_dir": "/root/autodl-tmp/ckpt_passk_stage2"
+    "save_freq": 10,
+    "default_local_dir": "/root/autodl-tmp/ckpt_reproduce_oom"
   }
 }
+
+
