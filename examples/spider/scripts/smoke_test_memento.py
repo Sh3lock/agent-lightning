@@ -39,6 +39,7 @@ def main() -> None:
         vector_store_factory=_store_factory,
         min_score_specific=0.0,
         min_score_skeleton=0.0,
+        allow_splits=[],
     )
     question = "how many users"
     specific_sql = "SELECT COUNT(*) FROM users"
