@@ -15,6 +15,7 @@ import re
 import shutil
 import tempfile
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, cast
 
 import pandas as pd
@@ -22,7 +23,7 @@ import termcolor
 from langchain.chat_models import init_chat_model
 from langchain_community.tools.sql_database.tool import QuerySQLDatabaseTool
 from langchain_community.utilities import SQLDatabase
-from langchain_core.messages import AnyMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, AnyMessage, BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -34,7 +35,80 @@ agl.setup_logging(apply_to=[__name__])
 
 logger = logging.getLogger(__name__)
 
+MEMENTO_POLICY_SKELETON_ONLY = "skeleton_only"
+MEMENTO_POLICY_TIERED = "tiered"
+MEMENTO_VALID_POLICIES = {MEMENTO_POLICY_SKELETON_ONLY, MEMENTO_POLICY_TIERED}
+DEFAULT_MEMENTO_TRAIN_POLICY = MEMENTO_POLICY_SKELETON_ONLY
+DEFAULT_MEMENTO_EVAL_POLICY = MEMENTO_POLICY_TIERED
 
+
+@dataclass(frozen=True)
+class MementoConfig:
+    enable: bool
+    train_policy: str
+    eval_policy: str
+
+
+def _validate_memento_policy(value: str, env_key: str, default: str) -> str:
+    if value in MEMENTO_VALID_POLICIES:
+        return value
+    logger.warning("Invalid %s=%s. Falling back to %s.", env_key, value, default)
+    return default
+
+
+def read_memento_config() -> MementoConfig:
+    enable = os.environ.get("MEMENTO_ENABLE", "0") == "1"
+    train_policy = os.environ.get("MEMENTO_TRAIN_POLICY", DEFAULT_MEMENTO_TRAIN_POLICY)
+    eval_policy = os.environ.get("MEMENTO_EVAL_POLICY", DEFAULT_MEMENTO_EVAL_POLICY)
+    train_policy = _validate_memento_policy(train_policy, "MEMENTO_TRAIN_POLICY", DEFAULT_MEMENTO_TRAIN_POLICY)
+    eval_policy = _validate_memento_policy(eval_policy, "MEMENTO_EVAL_POLICY", DEFAULT_MEMENTO_EVAL_POLICY)
+    return MementoConfig(enable=enable, train_policy=train_policy, eval_policy=eval_policy)
+
+
+def _maybe_init_memento_runtime(config: MementoConfig) -> Any:
+    if not config.enable:
+        return None
+    from memory_module.runtime import get_memento_runtime as _get_memento_runtime
+
+    return _get_memento_runtime(config)
+
+
+def _build_table_info_with_memory_context(
+    memory_context: str,
+    original_table_info: str,
+    max_chars: int,
+) -> str:
+    if not memory_context:
+        return original_table_info
+    schema_block = "### Current Schema\n" + original_table_info
+    available = max_chars - len(schema_block) - 2
+    if available <= 0:
+        return schema_block
+    trimmed = memory_context.strip()
+    if len(trimmed) > available:
+        trimmed = trimmed[:available].rstrip()
+    if not trimmed:
+        return schema_block
+    return f"{trimmed}\n\n{schema_block}"
+
+
+def _append_static_validation_feedback(feedback: str, message: str) -> str:
+    trimmed = _strip_query_conclusion(feedback).rstrip()
+    if trimmed:
+        trimmed += "\n\n"
+    trimmed += "### Static Validation Findings\n"
+    trimmed += f"- {message}\n"
+    trimmed += "THE QUERY IS INCORRECT."
+    return trimmed
+
+
+def _strip_query_conclusion(feedback: str) -> str:
+    lines = []
+    for line in feedback.splitlines():
+        if line.strip() in {"THE QUERY IS CORRECT.", "THE QUERY IS INCORRECT."}:
+            continue
+        lines.append(line)
+    return "\n".join(lines)
 WRITE_QUERY_PROMPT = ChatPromptTemplate(
     [
         (
@@ -195,6 +269,10 @@ class SQLAgent:
         table_info_truncate: int = 2048,
         execution_truncate: int = 2048,
     ):
+        self.db_id: str | None = None
+        self.memento_config: MementoConfig | None = None
+        self.memento_policy: str | None = None
+        self.memento_runtime: Any | None = None
         self.db = SQLDatabase.from_uri(db)  # type: ignore
         self.db_schema = db_schema
         self.debug = debug
@@ -271,23 +349,77 @@ class SQLAgent:
 
     def write_query(self, state: State) -> State:
         """Generate SQL query to fetch information."""
+        table_info = self.get_table_info()
+        retrieval_debug = None
+        if (
+            self.memento_config
+            and self.memento_config.enable
+            and self.memento_runtime
+            and getattr(self.memento_runtime, "casebank", None)
+        ):
+            policy = self.memento_policy or self.memento_config.eval_policy
+            db_id = self.db_id
+            if not db_id:
+                retrieval_debug = {"reason": "missing_db_id"}
+            else:
+                retrieval = self.memento_runtime.casebank.retrieve_tiered(
+                    question=state["question"],
+                    db_id=db_id,
+                    dialect=self.db.dialect,
+                    policy=policy,
+                    k=4,
+                )
+                retrieval_debug = retrieval.debug
+                if retrieval.type == "specific":
+                    cases = "\n\n".join(
+                        f"Case {idx + 1}:\n{case.text}" for idx, case in enumerate(retrieval.cases)
+                    )
+                    memory_context = (
+                        "### Relevant Past Cases (Same Database)\n"
+                        "You may reuse table/column names ONLY if they appear in CURRENT SCHEMA.\n\n"
+                        f"{cases}"
+                    )
+                    table_info = _build_table_info_with_memory_context(
+                        memory_context,
+                        table_info,
+                        self.table_info_truncate,
+                    )
+                elif retrieval.type == "skeleton":
+                    cases = "\n\n".join(
+                        f"Case {idx + 1}:\n{case.text}" for idx, case in enumerate(retrieval.cases)
+                    )
+                    memory_context = (
+                        "### Structural References (Different Database)\n"
+                        "DO NOT copy table/column names from these examples. Use only CURRENT SCHEMA.\n\n"
+                        f"{cases}"
+                    )
+                    table_info = _build_table_info_with_memory_context(
+                        memory_context,
+                        table_info,
+                        self.table_info_truncate,
+                    )
+
         prompt: Any = WRITE_QUERY_PROMPT.invoke(  # type: ignore
             {
                 "dialect": self.db.dialect,
                 "input": state["question"],
-                "table_info": self.get_table_info(),
+                "table_info": table_info,
             }
         )
         result = self.invoke_prompt(prompt)  # type: ignore
 
         query = self.parse_query(result) or result.content  # type: ignore
 
-        return {  # type: ignore
+        next_state = {  # type: ignore
             **state,
             "query": query,  # type: ignore
             "num_turns": 1,
             "messages": [*prompt.messages, result],
+            "prompt_table_info_chars": len(table_info),
         }
+        if retrieval_debug is not None:
+            next_state["memento_retrieval"] = retrieval_debug
+        return next_state  # type: ignore
 
     def execute_query(self, state: State) -> State:
         """Execute SQL query."""
@@ -302,33 +434,119 @@ class SQLAgent:
 
     def check_query(self, state: State) -> State:
         """Check the SQL query for correctness."""
+        table_info = self.get_table_info()
         prompt: Any = CHECK_QUERY_PROMPT.invoke(  # type: ignore
             {
                 "dialect": self.db.dialect,
                 "input": state["question"],
                 "query": state["query"],
                 "execution": self.truncate_execution(state["execution"]),
-                "table_info": self.get_table_info(),
+                "table_info": table_info,
             }
         )
         result = self.invoke_prompt(prompt)  # type: ignore
+        feedback = result.content  # type: ignore
+        llm_feedback_raw = feedback
+
+        validation_error = None
+        messages = [*state.get("messages", []), *prompt.messages, result]
+        if (
+            self.memento_config
+            and self.memento_config.enable
+            and self.memento_runtime
+            and getattr(self.memento_runtime, "validator", None)
+        ):
+            validation = self.memento_runtime.validator.validate(
+                state["query"],
+                table_info,
+                self.db.dialect,
+            )
+            validation_error = {
+                "ok": validation.ok,
+                "error_type": validation.error_type,
+                "message": validation.message,
+                "entities": validation.entities,
+            }
+            if not validation.ok and validation.error_type in {
+                "MissingColumn",
+                "MissingTable",
+                "AmbiguousColumn",
+                "SyntaxError",
+            }:
+                feedback = _append_static_validation_feedback(feedback, validation.message)
+                messages.append(AIMessage(content=feedback))
 
         res = {  # type: ignore
             **state,
-            "feedback": result.content,  # type: ignore
-            "messages": [*state.get("messages", []), *prompt.messages, result],
+            "feedback": feedback,  # type: ignore
+            "messages": messages,
+            "llm_feedback_raw": llm_feedback_raw,
         }
+        if validation_error is not None:
+            res["validation_error"] = validation_error
         return res  # type: ignore
 
     def rewrite_query(self, state: State) -> State:
         """Rewrite SQL query if necessary."""
+        feedback = state["feedback"]
+        if (
+            self.memento_config
+            and self.memento_config.enable
+            and self.memento_runtime
+            and getattr(self.memento_runtime, "error_fix_bank", None)
+        ):
+            from memory_module.error_normalizer import normalize_error
+
+            normalized = normalize_error(state.get("execution", ""), self.db.dialect)
+            query_parts = [normalized.error_type, normalized.raw]
+            question = state.get("question")
+            if question:
+                query_parts.append(question)
+            skeleton_sql = None
+            if getattr(self.memento_runtime, "skeletonizer", None):
+                skeleton_result = self.memento_runtime.skeletonizer.skeletonize(
+                    state["query"],
+                    self.db.dialect,
+                )
+                if not skeleton_result.failed:
+                    skeleton_sql = skeleton_result.skeleton_sql
+                    query_parts.append(skeleton_sql)
+            hints = []
+            if normalized.error_type not in {"Other", "Unavailable"}:
+                query_text = "\n".join(part for part in query_parts if part)
+                hints = self.memento_runtime.error_fix_bank.retrieve_fix_hints(
+                    error_type=normalized.error_type,
+                    dialect=self.db.dialect,
+                    query_text=query_text,
+                    k=4,
+                    min_score=0.30,
+                )
+            extra_sections = []
+            validation_error = state.get("validation_error")
+            if validation_error:
+                extra_sections.append(
+                    "### Static Validation Summary\n"
+                    f"- {validation_error.get('error_type')}: {validation_error.get('message')}"
+                )
+            if hints:
+                hint_lines = ["### Retrieved Fix Hints (Do not copy SQL verbatim)"]
+                for idx, hint in enumerate(hints, start=1):
+                    hint_lines.append(f"{idx}. {hint.text}")
+                hint_lines.append("You MUST use only columns/tables from Current Schema.")
+                extra_sections.append("\n".join(hint_lines))
+            if extra_sections:
+                feedback = feedback.rstrip() + "\n\n" + "\n\n".join(extra_sections)
+            normalized_error_type = normalized.error_type
+        else:
+            normalized_error_type = None
+
         prompt: Any = REWRITE_QUERY_PROMPT.invoke(  # type: ignore
             {
                 "dialect": self.db.dialect,
                 "input": state["question"],
                 "query": state["query"],
                 "execution": self.truncate_execution(state["execution"]),
-                "feedback": state["feedback"],
+                "feedback": feedback,
                 "table_info": self.get_table_info(),
             }
         )
@@ -341,6 +559,7 @@ class SQLAgent:
             "query": rewritten_query or state["query"],
             "num_turns": state.get("num_turns", 0) + 1,
             "messages": [*prompt.messages, result],  # clear previous prompts
+            "normalized_error_type": normalized_error_type,
         }
 
     def should_continue(self, state: State) -> Literal[END, "rewrite_query"]:  # type: ignore
@@ -440,6 +659,20 @@ class LitSQLAgent(agl.LitAgent[Dict[str, Any]]):
         question = task["question"]
         start_time = time.time()
         llm: agl.LLM = cast(agl.LLM, resources["main_llm"])
+        memento_config = read_memento_config()
+        runtime_policy = None
+        if memento_config.enable:
+            runtime_policy = (
+                memento_config.train_policy if rollout.mode == "train" else memento_config.eval_policy
+            )
+        rollout_id = rollout.rollout_id
+        if memento_config.enable:
+            logger.debug(
+                "[Rollout %s] Memento enabled (policy=%s, mode=%s).",
+                rollout_id,
+                runtime_policy,
+                rollout.mode,
+            )
 
         if rollout.mode == "train":
             original_db_path = os.path.join(self.spider_dir, "database", task["db_id"], task["db_id"] + ".sqlite")
@@ -459,8 +692,6 @@ class LitSQLAgent(agl.LitAgent[Dict[str, Any]]):
             logger.error("Schema file not found: %s", schema_path)
             schema = "No schema available."
 
-        rollout_id = rollout.rollout_id
-
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = os.path.join(temp_dir, os.path.basename(original_db_path))
             shutil.copyfile(original_db_path, db_path)
@@ -468,7 +699,7 @@ class LitSQLAgent(agl.LitAgent[Dict[str, Any]]):
             logger.info(f"[Rollout {rollout_id}] Ground Truth: {ground_truth}")
 
             # Run the agent
-            agent = SQLAgent(
+            sql_agent = SQLAgent(
                 "sqlite:///" + db_path,
                 max_turns=self.max_turns,
                 table_info_truncate=self.table_info_truncate,
@@ -488,7 +719,15 @@ class LitSQLAgent(agl.LitAgent[Dict[str, Any]]):
                         ),
                     }
                 ),
-            ).graph()
+            )
+            sql_agent.memento_runtime = None
+            sql_agent.memento_policy = None
+            sql_agent.memento_config = memento_config
+            sql_agent.db_id = task.get("db_id")
+            if memento_config.enable:
+                sql_agent.memento_policy = runtime_policy
+                sql_agent.memento_runtime = _maybe_init_memento_runtime(memento_config)
+            agent = sql_agent.graph()
             try:
                 # Required to make the langchain tracing work
                 handler = self.tracer.get_langchain_handler()
