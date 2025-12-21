@@ -5,7 +5,7 @@
 export WANDB_API_KEY="f093b349bddb4e99f211c7ba587579159de4e66b"
 export WANDB_DIR=/home/storage/wenbinxing/ltf/passk/agent-lightning/wandb_logs
 export VLLM_USE_V1=1
-export RAY_DATA_DISK_USAGE_THRESHOLD=0.98
+export RAY_DATA_DISK_USAGE_THRESHOLD=0.99
 # 1. 路径管理：既要深目录的整洁，又要给 Ray 一个短路径
 TS="$(date +%Y%m%d_%H%M%S)"
 MY_USER=$(whoami)
@@ -25,6 +25,7 @@ export RAY_TMPDIR="$SHORT_LINK"
 echo "=== 路径配置 ==="
 echo "实际存放位置: $REAL_RAY_DIR"
 echo "Ray 识别路径: $RAY_TMPDIR"
+
 # 2. 核心参数设置
 STAGE=1
 CONFIG_STAGE1="configs/passk_stage1_qwen05b.json"
@@ -40,27 +41,12 @@ get_free_port() {
 }
 
 # 3. 清理残留进程
-# my_pids=$(pgrep -u "$MY_USER" -f "ray|train_sql_agent.py" | grep -v $$)
-# if [ -n "$my_pids" ]; then
-#     echo "发送 SIGTERM 信号..."
-#     echo "$my_pids" | xargs kill -15 2>/dev/null
-    
-#     # 给驱动和显卡 10 秒钟的喘息时间来回收资源
-#     echo "等待 10 秒让显存回收..."
-#     sleep 5
-# fi
-
-# # 2. 如果还有残留，再使用强杀，但要先检查驱动是否还活着
-# if timeout 2s nvidia-smi > /dev/null; then
-#     remaining_pids=$(pgrep -u "$MY_USER" -f "python|ray|train_sql_agent" | grep -v $$)
-#     if [ -n "$remaining_pids" ]; then
-#         echo "清理顽固进程..."
-#         echo "$remaining_pids" | xargs kill -9 2>/dev/null
-#     fi
-# else
-#     echo "警告：检测到 GPU 驱动响应异常，停止启动脚本，请检查硬件！"
-#     exit 1
-# fi
+my_pids=$(pgrep -u "$MY_USER" -f "python|ray|train_sql_agent" | grep -v $$)
+if [ -n "$my_pids" ]; then
+    echo "清理属于 $MY_USER 的残留进程..."
+    echo "$my_pids" | xargs kill -9 2>/dev/null
+    sleep 1
+fi
 
 # 4. 动态分配端口
 SAFE_AGL_PORT=$(get_free_port 4750)
@@ -87,10 +73,9 @@ mkdir -p "$SPIDER_DIR/log"
 # --- 正式启动 ---
 export RAY_CHDIR_TO_TEMPDIR=1
 
-CUDA_VISIBLE_DEVICES=6 nohup python train_sql_agent.py local_qwen05 \
+CUDA_VISIBLE_DEVICES=6 python train_sql_agent.py local_qwen05 \
   --config-file "$CONFIG_PATH" \
-  $STAGE_ARG \
-  >> "$LOG_FILE" 2>&1 &
+  $STAGE_ARG 
 
 echo "----------------------------------------"
 echo "训练已启动！"

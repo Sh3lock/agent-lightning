@@ -3,7 +3,7 @@ from langchain_community.utilities import SQLDatabase
 import os
 
 # Path to data
-DATA_DIR = "/root/verl_pass/agent-lightning/examples/spider/data"
+DATA_DIR = "/home/storage/wenbinxing/ltf/passk/agent-lightning/examples/spider/data"
 PARQUET_FILE = os.path.join(DATA_DIR, "train_spider.parquet")
 DB_DIR = os.path.join(DATA_DIR, "database")
 

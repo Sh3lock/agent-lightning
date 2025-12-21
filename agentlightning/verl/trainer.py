@@ -221,6 +221,15 @@ class AgentLightningTrainer(RayPPOTrainer):
         
         self._log_interval = getattr(self.config.trainer, "log_interval", 1)
         self._log_window = deque(maxlen=self._log_interval)
+        
+        # Initialize best model tracking
+        self.best_success = -1  # Track the best success rate (out of 100)
+        self.best_step = -1     # Track the step where best model was saved
+        print(f"[AgentLightningTrainer] Initialized best model tracking: best_success={self.best_success}")
+        
+        # Write initial status to progress file
+        progress_msg = f"Training started at {datetime.now():%Y-%m-%d %H:%M:%S}. Global steps: 0"
+        self._progress_log(progress_msg)
 
     def _validate(self):
         assert len(self.val_dataloader) == 1, "Please set val_batch_size to None for better throughput."
@@ -338,6 +347,58 @@ class AgentLightningTrainer(RayPPOTrainer):
         except Exception as e:
             print(f"[AgentLightningTrainer] Failed to write to progress log: {e}")
             return
+
+    def _save_best_checkpoint(self, suffix: str = "best"):
+        """Save the best checkpoint with a custom suffix."""
+        from verl.utils.fs import local_mkdir_safe
+
+        # Use the configured checkpoint directory
+        checkpoint_dir = self.config.trainer.default_local_dir
+        best_checkpoint_folder = os.path.join(checkpoint_dir, suffix)
+        
+        print(f"[SaveBest] Saving best checkpoint to: {best_checkpoint_folder}")
+        
+        # Save actor model
+        actor_local_path = os.path.join(best_checkpoint_folder, "actor")
+        actor_remote_path = (
+            None
+            if self.config.trainer.default_hdfs_dir is None
+            else os.path.join(self.config.trainer.default_hdfs_dir, suffix, "actor")
+        )
+        
+        self.actor_rollout_wg.save_checkpoint(
+            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=1
+        )
+        
+        # Save critic model if used
+        if self.use_critic:
+            critic_local_path = os.path.join(best_checkpoint_folder, "critic")
+            critic_remote_path = (
+                None
+                if self.config.trainer.default_hdfs_dir is None
+                else os.path.join(self.config.trainer.default_hdfs_dir, suffix, "critic")
+            )
+            self.critic_wg.save_checkpoint(
+                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=1
+            )
+        
+        # Save training metadata
+        local_mkdir_safe(best_checkpoint_folder)
+        metadata_path = os.path.join(best_checkpoint_folder, "metadata.json")
+        metadata = {
+            "global_step": self.global_steps,
+            "best_success": self.best_success,
+            "timestamp": datetime.now().isoformat(),
+            "config": OmegaConf.to_container(self.config, resolve=True)
+        }
+        
+        try:
+            with open(metadata_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
+        except Exception as e:
+            print(f"[SaveBest] Failed to save metadata: {e}")
+        
+        print(f"[SaveBest] Successfully saved best checkpoint at step {self.global_steps} with success={self.best_success}")
 
     def _train_step(self, batch_dict: dict) -> dict:
         # Isolate in a separate method to automatically recycle the variables before validation.
@@ -621,6 +682,7 @@ class AgentLightningTrainer(RayPPOTrainer):
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
+                    
                     # write validation summary to progress log
                     ts_val = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     key, val = self._select_val_metric(val_metrics)
@@ -632,14 +694,36 @@ class AgentLightningTrainer(RayPPOTrainer):
                     self._progress_log(log_msg)
                     # Also log all validation metrics for debugging/completeness
                     self._progress_log(f"[{ts_val}] [val-full] {json.dumps(val_metrics)}")
+                    
+                    # Check if this is the best model so far
+                    current_success = val_metrics.get("val/n_success", -1)
+                    if current_success > self.best_success:
+                        self.best_success = current_success
+                        self.best_step = self.global_steps
+                        print(f"[BestModel] New best model! Success: {self.best_success} at step {self.best_step}")
+                        
+                        # Save the best model
+                        with _timer("save_best_checkpoint", timing_raw):
+                            self._save_best_checkpoint("best")
+                        
+                        # Write success to the final status file 
+                        try:
+                            progress_file_dir = os.path.dirname(self._progress_log_file) if self._progress_log_file else os.getcwd()
+                            success_file = os.path.join(progress_file_dir, "success")
+                            with open(success_file, "w", encoding="utf-8") as f:
+                                f.write("success\n")
+                                f.flush()
+                        except Exception as e:
+                            print(f"[BestModel] Failed to write success file: {e}")
                 elif self.global_steps % 10 == 0: # Debug print every 10 steps if not validating
                      print(f"[Debug] Skipping validation. Step: {self.global_steps}, test_freq: {self.config.trainer.test_freq}, val_reward_fn: {self.val_reward_fn is not None}")
 
-                if self.config.trainer.save_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
-                ):
-                    with _timer("save_checkpoint", timing_raw):
-                        self._save_checkpoint()
+                # Remove regular checkpoint saving - we only save best models now
+                # if self.config.trainer.save_freq > 0 and (
+                #     is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+                # ):
+                #     with _timer("save_checkpoint", timing_raw):
+                #         self._save_checkpoint()
 
                 # step metrics
                 metrics.update(

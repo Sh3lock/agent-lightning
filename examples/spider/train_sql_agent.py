@@ -535,7 +535,7 @@ def train(config: Dict[str, Any], active_agent: Optional[str]) -> None:
 
     agent = LitSQLAgent()
     algorithm = agl.VERL(config)
-    trainer = agl.Trainer(n_runners=10, algorithm=algorithm, adapter={"agent_match": active_agent})
+    trainer = agl.Trainer(n_runners=24, algorithm=algorithm, adapter={"agent_match": active_agent})
     print("Adapter agent match acknowledged:", trainer.adapter.agent_match)  # type: ignore
 
     # 检查关闭标志
