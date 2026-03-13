@@ -33,6 +33,14 @@ import agentlightning as agl
 agl.setup_logging(apply_to=[__name__])
 
 logger = logging.getLogger(__name__)
+_LOG_ROLLOUT_INFO = os.getenv("SPIDER_LOG_ROLLOUT_INFO", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _rollout_log(message: str, *args: object) -> None:
+    if _LOG_ROLLOUT_INFO:
+        logger.info(message, *args)
+    else:
+        logger.debug(message, *args)
 
 
 WRITE_QUERY_PROMPT = ChatPromptTemplate(
@@ -41,7 +49,7 @@ WRITE_QUERY_PROMPT = ChatPromptTemplate(
             "system",
             """
 You are an agent designed to interact with a SQL database.
-     Given an input question, create a syntactically correct {dialect} query to run to help find the answer.
+Given an input question, create a syntactically correct {dialect} query to run to help find the answer.
 
 Pay attention to use only the column names that you can see in the schema description.
 Be careful to not query for columns that do not exist.
@@ -51,7 +59,7 @@ Also, pay attention to which column is in which table.
 
 Only use the following tables:
 {table_info}
-
+{guidance}
 ## Output Format ##
 
 Respond in the following format:
@@ -180,6 +188,8 @@ class State(MessagesState):
     feedback: str
     num_turns: int
     messages: list[AnyMessage]
+    guidance: str
+    guidance_level: str
 
 
 class SQLAgent:
@@ -241,12 +251,13 @@ class SQLAgent:
             return "No schema available."
 
     def invoke_prompt(self, prompt: Any) -> AnyMessage:
+        prompt_messages = prompt.messages if hasattr(prompt, "messages") else prompt
         if self.debug:
-            for message in prompt.messages:
+            for message in prompt_messages:
                 termcolor.cprint(message.pretty_repr(), "blue")
 
         try:
-            result = self.llm.invoke(prompt)
+            result = self.llm.invoke(prompt_messages)
         except Exception as e:
             logger.error(f"Failed to invoke prompt: {e}")
             # FIXME: fallback to create a random trajectory
@@ -271,14 +282,36 @@ class SQLAgent:
 
     def write_query(self, state: State) -> State:
         """Generate SQL query to fetch information."""
+        guidance_level = state.get("guidance_level", "")
+        guidance_text = state.get("guidance", "")
+
+        # Build guidance block: embedded in prompt template (not as separate message)
+        # This is the simplified approach: guidance is part of system message
+        #
+        # Template structure:
+        #   {table_info}
+        #   {guidance}
+        #   ## Output Format ##
+        #
+        # Raw mode: guidance_block = "" -> "{table_info}\n\n## Output Format ##" (matches original)
+        # Guided mode: guidance_block = "\n## Guidance ##\n\n{text}" -> adds Guidance section
+        if guidance_level in {"L1", "L2"} and guidance_text:
+            # guided mode: add Guidance section with proper spacing
+            guidance_block = f"\n## Guidance ##\n\n{guidance_text}"
+        else:
+            # raw mode: empty string, template's blank line preserved
+            guidance_block = ""
+
         prompt: Any = WRITE_QUERY_PROMPT.invoke(  # type: ignore
             {
                 "dialect": self.db.dialect,
                 "input": state["question"],
                 "table_info": self.get_table_info(),
+                "guidance": guidance_block,
             }
         )
-        result = self.invoke_prompt(prompt)  # type: ignore
+        prompt_messages = list(prompt.messages)
+        result = self.invoke_prompt(prompt_messages)  # type: ignore
 
         query = self.parse_query(result) or result.content  # type: ignore
 
@@ -286,7 +319,7 @@ class SQLAgent:
             **state,
             "query": query,  # type: ignore
             "num_turns": 1,
-            "messages": [*prompt.messages, result],
+            "messages": [*prompt_messages, result],
         }
 
     def execute_query(self, state: State) -> State:
@@ -441,7 +474,26 @@ class LitSQLAgent(agl.LitAgent[Dict[str, Any]]):
         start_time = time.time()
         llm: agl.LLM = cast(agl.LLM, resources["main_llm"])
 
-        if rollout.mode == "train":
+        rollout_mode = getattr(rollout, "mode", None)
+        if rollout_mode is None:
+            task_mode = getattr(getattr(rollout, "task", None), "mode", None)
+            rollout_mode = task_mode
+        if rollout_mode is None:
+            rollout_mode = "train"
+
+        attempt_id = None
+        attempt = getattr(rollout, "attempt", None)
+        if attempt is not None:
+            attempt_id = getattr(attempt, "attempt_id", None)
+        if not isinstance(attempt_id, str):
+            attempt_id = None
+        base_url = (
+            llm.get_base_url(rollout.rollout_id, attempt_id)
+            if attempt_id
+            else llm.get_base_url(None, None)
+        )
+
+        if rollout_mode == "train":
             original_db_path = os.path.join(self.spider_dir, "database", task["db_id"], task["db_id"] + ".sqlite")
         else:
             original_db_path = os.path.join(self.spider_dir, "test_database", task["db_id"], task["db_id"] + ".sqlite")
@@ -464,8 +516,8 @@ class LitSQLAgent(agl.LitAgent[Dict[str, Any]]):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = os.path.join(temp_dir, os.path.basename(original_db_path))
             shutil.copyfile(original_db_path, db_path)
-            logger.info(f"[Rollout {rollout_id}] Question: {question}")
-            logger.info(f"[Rollout {rollout_id}] Ground Truth: {ground_truth}")
+            _rollout_log("[Rollout %s] Question: %s", rollout_id, question)
+            _rollout_log("[Rollout %s] Ground Truth: %s", rollout_id, ground_truth)
 
             # Run the agent
             agent = SQLAgent(
@@ -475,10 +527,10 @@ class LitSQLAgent(agl.LitAgent[Dict[str, Any]]):
                 execution_truncate=self.execution_truncate,
                 debug=False,
                 db_schema=schema,
-                endpoint=llm.get_base_url(rollout.rollout_id, rollout.attempt.attempt_id),  # type: ignore
+                endpoint=base_url,
                 verl_replacement=(
                     {"model": llm.model, **llm.sampling_parameters}
-                    if rollout.mode == "train"
+                    if rollout_mode == "train"
                     else {
                         "model": llm.model,
                         "temperature": (
@@ -492,15 +544,17 @@ class LitSQLAgent(agl.LitAgent[Dict[str, Any]]):
             try:
                 # Required to make the langchain tracing work
                 handler = self.tracer.get_langchain_handler()
+                guidance = str(task.get("guidance", "") or "")
+                guidance_level = str(task.get("guidance_level", "") or "").upper()
                 result = agent.invoke(  # type: ignore
-                    {"question": question},  # type: ignore
+                    {"question": question, "guidance": guidance, "guidance_level": guidance_level},  # type: ignore
                     {"callbacks": [handler] if handler else [], "recursion_limit": 100},
                 )
             except Exception as e:
                 logger.exception(f"[Rollout {rollout_id}] Error during agent invocation: {e}")
                 return
 
-            logger.info(f"[Rollout {rollout_id}] Generated Query: {result['query']}")
+            _rollout_log("[Rollout %s] Generated Query: %s", rollout_id, result["query"])
 
         end_time_rollout = time.time()
 
@@ -509,12 +563,12 @@ class LitSQLAgent(agl.LitAgent[Dict[str, Any]]):
             shutil.copyfile(original_db_path, db_path)
 
             reward = evaluate_query(result["query"], ground_truth, db_path, raise_on_error=False)
-            logger.info("[Rollout %s] Reward: %s", rollout_id, reward)
+            _rollout_log("[Rollout %s] Reward: %s", rollout_id, reward)
 
         end_time_eval = time.time()
 
-        logger.info("[Rollout %s] Time taken for rollout: %.2f seconds", rollout_id, end_time_rollout - start_time)
-        logger.info(
+        _rollout_log("[Rollout %s] Time taken for rollout: %.2f seconds", rollout_id, end_time_rollout - start_time)
+        _rollout_log(
             "[Rollout %s] Time taken for evaluation: %.2f seconds", rollout_id, end_time_eval - end_time_rollout
         )
 

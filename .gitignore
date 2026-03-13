@@ -220,3 +220,10 @@ docker/data/
 examples/spider/ckpt/
 examples/spider/log/
 wandb_logs/
+examples/spider/eval_matrix/
+examples/spider/log/
+examples/spider/ray/
+**/launcher.log
+**/raw.log
+**/gpu_monitor.csv
+**/cpu_monitor.csv

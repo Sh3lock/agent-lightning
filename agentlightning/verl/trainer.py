@@ -4,16 +4,18 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
+import os
 import random
 import time
-import os
-import json
+from collections import defaultdict, deque
 from contextlib import contextmanager
-from collections import deque
 from copy import deepcopy
 from datetime import datetime
 from pprint import pprint
-from typing import Dict, Tuple, Type
+from typing import Dict, Optional, Tuple, Type
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +52,49 @@ __all__ = [
     "AgentLightningTrainer",
 ]
 
+logger = logging.getLogger(__name__)
+
+_ROUND_P_GUIDED = {
+    0: 1.0,
+    1: 0.5,
+    2: 0.25,
+    3: 0.0,
+}
+
+
+def _stable_sample_id(db_id: str, question: str) -> str:
+    payload = f"{db_id}\n{question}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _resolve_round_p_guided(round_idx: int, override: Optional[float]) -> float:
+    if override is not None:
+        return max(0.0, min(1.0, float(override)))
+    return _ROUND_P_GUIDED.get(round_idx, 0.0)
+
+
+def _should_guided(sample_id: str, p_guided: float) -> bool:
+    if p_guided <= 0.0:
+        return False
+    if p_guided >= 1.0:
+        return True
+    hash_prefix = sample_id[:8]
+    threshold = int(hash_prefix, 16) / 16**8
+    return threshold < p_guided
+
+
+def _load_jsonl(path: Path) -> list[dict]:
+    records: list[dict] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                logger.warning("Skipping invalid JSONL line in %s", path)
+    return records
 
 @contextmanager
 def _timer(name: str, timing_raw: Dict[str, float]):
@@ -230,6 +275,180 @@ class AgentLightningTrainer(RayPPOTrainer):
         # Write initial status to progress file
         progress_msg = f"Training started at {datetime.now():%Y-%m-%d %H:%M:%S}. Global steps: 0"
         self._progress_log(progress_msg)
+        self._init_guidance_state()
+
+    def _init_guidance_state(self) -> None:
+        self._guidance_enabled = False
+        self._guidance_round = None
+        self._p_guided = 0.0
+        self._hard_sample_ids: set[str] = set()
+        self._guidance_map: dict[str, dict] = {}
+        self._ignite_map: dict[str, str] = {}
+        self._raw_success_state: dict[str, bool] = {}
+        self._guidance_decisions: dict[str, dict] = {}
+        self._guidance_stats = defaultdict(int)
+        self._guidance_warned_missing_fields = False
+
+        guidance_cfg = getattr(self.config, "agentlightning_guidance", None)
+        if guidance_cfg is None:
+            logger.info("Guidance config missing; defaulting to raw-only training.")
+            return
+
+        cfg = guidance_cfg
+        if OmegaConf.is_config(cfg):
+            cfg = OmegaConf.to_container(cfg, resolve=True)
+
+        if not isinstance(cfg, dict):
+            logger.warning("Guidance config is not a dict; defaulting to raw-only training.")
+            return
+
+        self._guidance_round = cfg.get("round")
+        round_idx = int(self._guidance_round) if self._guidance_round is not None else -1
+        self._p_guided = _resolve_round_p_guided(round_idx, cfg.get("p_guided"))
+
+        hard_samples_path = cfg.get("hard_samples")
+        guidance_path = cfg.get("guidance")
+        ignite_path = cfg.get("ignite")
+        raw_success_path = cfg.get("raw_success_state")
+
+        if hard_samples_path:
+            path = Path(hard_samples_path)
+            if path.exists():
+                for record in _load_jsonl(path):
+                    sample_id = record.get("sample_id")
+                    if sample_id:
+                        self._hard_sample_ids.add(sample_id)
+            else:
+                logger.warning("Hard samples file missing: %s", hard_samples_path)
+
+        if guidance_path:
+            path = Path(guidance_path)
+            if path.exists():
+                for record in _load_jsonl(path):
+                    sample_id = record.get("sample_id")
+                    if sample_id:
+                        self._guidance_map[sample_id] = record
+            else:
+                logger.warning("Guidance file missing: %s", guidance_path)
+
+        if ignite_path:
+            path = Path(ignite_path)
+            if path.exists():
+                for record in _load_jsonl(path):
+                    sample_id = record.get("sample_id")
+                    min_level = record.get("min_level")
+                    if sample_id and isinstance(min_level, str):
+                        self._ignite_map[sample_id] = min_level
+            else:
+                logger.warning("Ignite file missing: %s", ignite_path)
+
+        if raw_success_path:
+            path = Path(raw_success_path)
+            if path.exists():
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    items = payload.get("items", {})
+                    if isinstance(items, dict):
+                        for sample_id, info in items.items():
+                            if isinstance(info, dict):
+                                self._raw_success_state[sample_id] = bool(info.get("ever_raw_success", False))
+                except json.JSONDecodeError:
+                    logger.warning("Raw success state file is invalid JSON: %s", raw_success_path)
+            else:
+                logger.warning("Raw success state file missing: %s", raw_success_path)
+
+        if self._hard_sample_ids and self._guidance_map:
+            self._guidance_enabled = True
+        else:
+            logger.info("Guidance disabled (missing hard samples or guidance map).")
+            self._guidance_enabled = False
+
+        logger.info(
+            "Guidance init: round=%s p_guided=%.3f hard=%s guidance=%s ignite=%s raw_success=%s",
+            round_idx,
+            self._p_guided,
+            len(self._hard_sample_ids),
+            len(self._guidance_map),
+            len(self._ignite_map),
+            len(self._raw_success_state),
+        )
+
+    def _resolve_guidance_for_sample(self, sample_id: str) -> tuple[str, str]:
+        cached = self._guidance_decisions.get(sample_id)
+        if cached is not None:
+            return cached["guidance"], cached["guidance_level"]
+
+        if not self._guidance_enabled:
+            self._guidance_stats["n_guidance_disabled"] += 1
+            decision = {"guidance": "", "guidance_level": ""}
+            self._guidance_decisions[sample_id] = decision
+            return decision["guidance"], decision["guidance_level"]
+
+        if self._raw_success_state.get(sample_id, False):
+            self._guidance_stats["n_force_raw_success"] += 1
+            decision = {"guidance": "", "guidance_level": ""}
+            self._guidance_decisions[sample_id] = decision
+            return decision["guidance"], decision["guidance_level"]
+
+        if sample_id not in self._hard_sample_ids:
+            self._guidance_stats["n_force_raw_non_hard"] += 1
+            decision = {"guidance": "", "guidance_level": ""}
+            self._guidance_decisions[sample_id] = decision
+            return decision["guidance"], decision["guidance_level"]
+
+        if not _should_guided(sample_id, self._p_guided):
+            self._guidance_stats["n_force_raw_p_guided"] += 1
+            decision = {"guidance": "", "guidance_level": ""}
+            self._guidance_decisions[sample_id] = decision
+            return decision["guidance"], decision["guidance_level"]
+
+        min_level = self._ignite_map.get(sample_id, "L1")
+        guidance_level = "L2" if min_level == "L2" else "L1"
+        guidance_record = self._guidance_map.get(sample_id, {})
+        guidance_key = "guidance_l2" if guidance_level == "L2" else "guidance_l1"
+        guidance_text = guidance_record.get(guidance_key, "")
+
+        if not guidance_text:
+            self._guidance_stats["n_force_raw_missing_guidance"] += 1
+            decision = {"guidance": "", "guidance_level": ""}
+            self._guidance_decisions[sample_id] = decision
+            return decision["guidance"], decision["guidance_level"]
+
+        self._guidance_stats["n_guided_selected"] += 1
+        decision = {"guidance": guidance_text, "guidance_level": guidance_level}
+        self._guidance_decisions[sample_id] = decision
+        return decision["guidance"], decision["guidance_level"]
+
+    def _augment_batch_with_guidance(self, batch_dict: dict) -> dict:
+        questions = batch_dict.get("question")
+        db_ids = batch_dict.get("db_id")
+        if questions is None or db_ids is None:
+            if not self._guidance_warned_missing_fields:
+                logger.warning("Missing question/db_id in batch; guidance disabled for this batch.")
+                self._guidance_warned_missing_fields = True
+            return batch_dict
+
+        sample_ids: list[str] = []
+        guidances: list[str] = []
+        guidance_levels: list[str] = []
+        per_sample_seen: dict[str, tuple[str, str]] = {}
+
+        for db_id, question in zip(db_ids, questions):
+            sample_id = _stable_sample_id(str(db_id), str(question))
+            guidance_text, guidance_level = self._resolve_guidance_for_sample(sample_id)
+            sample_ids.append(sample_id)
+            guidances.append(guidance_text)
+            guidance_levels.append(guidance_level)
+            if sample_id in per_sample_seen and per_sample_seen[sample_id] != (guidance_text, guidance_level):
+                raise ValueError(f"Inconsistent guidance decision within batch for sample_id={sample_id}")
+            per_sample_seen[sample_id] = (guidance_text, guidance_level)
+
+        batch_dict = dict(batch_dict)
+        # DataProto only accepts torch.Tensor or np.ndarray values.
+        batch_dict["sample_id"] = np.array(sample_ids, dtype=object)
+        batch_dict["guidance"] = np.array(guidances, dtype=object)
+        batch_dict["guidance_level"] = np.array(guidance_levels, dtype=object)
+        return batch_dict
 
     def _validate(self):
         assert len(self.val_dataloader) == 1, "Please set val_batch_size to None for better throughput."
@@ -402,6 +621,7 @@ class AgentLightningTrainer(RayPPOTrainer):
 
     def _train_step(self, batch_dict: dict) -> dict:
         # Isolate in a separate method to automatically recycle the variables before validation.
+        batch_dict = self._augment_batch_with_guidance(batch_dict)
         batch: DataProto = DataProto.from_single_dict(batch_dict)
         metrics = {}
         timing_raw = {}
@@ -586,6 +806,8 @@ class AgentLightningTrainer(RayPPOTrainer):
         # TODO: implement actual tflpo and theoretical tflpo
         n_gpus = self.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+        if self._guidance_stats:
+            metrics.update({f"guidance/{key}": value for key, value in self._guidance_stats.items()})
 
         return metrics
 
@@ -779,6 +1001,17 @@ class AgentLightningTrainer(RayPPOTrainer):
                         f"reward {reward_avg if reward_avg is not None else 'n/a'} | lr {lr_val}"
                     )
                     self._progress_log(line)
+                    # Log guidance stats if enabled
+                    if self._guidance_enabled and self._guidance_stats:
+                        guided = self._guidance_stats.get("n_guided_selected", 0)
+                        raw_p = self._guidance_stats.get("n_force_raw_p_guided", 0)
+                        raw_success = self._guidance_stats.get("n_force_raw_success", 0)
+                        raw_non_hard = self._guidance_stats.get("n_force_raw_non_hard", 0)
+                        guidance_line = (
+                            f"[{ts}] [guidance] guided={guided} | raw_p_guided={raw_p} | "
+                            f"raw_success={raw_success} | raw_non_hard={raw_non_hard}"
+                        )
+                        self._progress_log(guidance_line)
                     self._log_sequence_window(metrics)
 
                 if is_last_step:

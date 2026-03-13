@@ -39,7 +39,11 @@ class PatchedvLLMServer(_unwrap_ray_remote(AsyncvLLMServer)):
         generator = await self.openai_serving_chat.create_chat_completion(request, raw_request)
 
         if isinstance(generator, ErrorResponse):
-            return JSONResponse(content=generator.model_dump(), status_code=generator.code)
+            # vLLM ErrorResponse schema changed across versions; tolerate both fields.
+            status_code = getattr(generator, "code", None)
+            if status_code is None:
+                status_code = getattr(generator, "status_code", 500)
+            return JSONResponse(content=generator.model_dump(), status_code=int(status_code))
         if request.stream:
             return StreamingResponse(content=generator, media_type="text/event-stream")
         else:

@@ -25,12 +25,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import platform
 import signal
 import subprocess
 import threading
 import time
+import traceback
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -162,6 +164,200 @@ DEFAULT_LOCAL_QWEN05_CONFIG_FILE = Path(__file__).resolve().parent / "configs" /
 def _write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def _env_true(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str) -> Optional[float]:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    return float(raw)
+
+
+def _env_int(name: str) -> Optional[int]:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    return int(raw)
+
+
+def _apply_runtime_stability_overrides(config: Dict[str, Any]) -> None:
+    """Apply opt-in runtime overrides for stability/debugging."""
+
+    arr = config.setdefault("actor_rollout_ref", {})
+    model_cfg = arr.setdefault("model", {})
+    actor_cfg = arr.setdefault("actor", {})
+    ref_cfg = arr.setdefault("ref", {})
+    rollout_cfg = arr.setdefault("rollout", {})
+
+    if os.getenv("SPIDER_USE_REMOVE_PADDING") is not None:
+        use_rmpad = _env_true("SPIDER_USE_REMOVE_PADDING")
+        model_cfg["use_remove_padding"] = use_rmpad
+        print(f"[stability] override model.use_remove_padding={use_rmpad}")
+
+    if os.getenv("SPIDER_USE_TORCH_COMPILE") is not None:
+        use_compile = _env_true("SPIDER_USE_TORCH_COMPILE")
+        actor_cfg["use_torch_compile"] = use_compile
+        ref_cfg["use_torch_compile"] = use_compile
+        print(f"[stability] override actor/ref use_torch_compile={use_compile}")
+
+    override_logprob_mb = _env_int("SPIDER_LOGPROB_MICRO_BATCH_SIZE_PER_GPU")
+    if override_logprob_mb is not None:
+        if override_logprob_mb <= 0:
+            raise ValueError("SPIDER_LOGPROB_MICRO_BATCH_SIZE_PER_GPU must be > 0.")
+        rollout_cfg["log_prob_micro_batch_size_per_gpu"] = override_logprob_mb
+        ref_cfg["log_prob_micro_batch_size_per_gpu"] = override_logprob_mb
+        print(f"[stability] override log_prob_micro_batch_size_per_gpu={override_logprob_mb}")
+    elif model_cfg.get("use_remove_padding") is False:
+        safe_logprob_mb = _env_int("SPIDER_SAFE_LOGPROB_MB_WHEN_DENSE")
+        if safe_logprob_mb is None:
+            safe_logprob_mb = 8
+        if safe_logprob_mb <= 0:
+            raise ValueError("SPIDER_SAFE_LOGPROB_MB_WHEN_DENSE must be > 0.")
+        current_rollout_mb = int(rollout_cfg.get("log_prob_micro_batch_size_per_gpu", safe_logprob_mb))
+        current_ref_mb = int(ref_cfg.get("log_prob_micro_batch_size_per_gpu", safe_logprob_mb))
+        new_rollout_mb = min(current_rollout_mb, safe_logprob_mb)
+        new_ref_mb = min(current_ref_mb, safe_logprob_mb)
+        if new_rollout_mb != current_rollout_mb or new_ref_mb != current_ref_mb:
+            rollout_cfg["log_prob_micro_batch_size_per_gpu"] = new_rollout_mb
+            ref_cfg["log_prob_micro_batch_size_per_gpu"] = new_ref_mb
+            print(
+                "[stability] dense log-prob path detected; auto-capped "
+                f"log_prob_micro_batch_size_per_gpu to rollout={new_rollout_mb}, ref={new_ref_mb}"
+            )
+
+    util = _env_float("SPIDER_ROLLOUT_GPU_MEMORY_UTILIZATION")
+    if util is not None:
+        if util <= 0 or util >= 1:
+            raise ValueError("SPIDER_ROLLOUT_GPU_MEMORY_UTILIZATION must be in (0, 1).")
+        rollout_cfg["gpu_memory_utilization"] = util
+        print(f"[stability] override rollout.gpu_memory_utilization={util}")
+
+
+def _resolve_run_root() -> Path:
+    """Resolve where per-run logs/config/errors should be written."""
+
+    env_root = os.getenv("SPIDER_RUN_ROOT")
+    if env_root:
+        return Path(env_root).expanduser()
+    return Path(__file__).resolve().parent / "log"
+
+
+def _rewrite_checkpoint_root(config: Dict[str, Any], run_name: str) -> None:
+    """Optionally rewrite checkpoint root to external storage and isolate each run."""
+
+    trainer_cfg = config.setdefault("trainer", {})
+    ckpt_root = os.getenv("SPIDER_CKPT_ROOT")
+    if not ckpt_root:
+        return
+
+    exp_name = str(trainer_cfg.get("experiment_name") or run_name)
+    target = Path(ckpt_root).expanduser() / exp_name
+    # Prevent concurrent runs from writing to the same checkpoint directory.
+    if os.getenv("SPIDER_ISOLATE_CKPT", "1") != "0":
+        target = target / run_name
+    target.mkdir(parents=True, exist_ok=True)
+    trainer_cfg["default_local_dir"] = str(target)
+
+
+def _install_warning_error_logger(run_dir: Path) -> None:
+    """Keep a compact log that only stores warnings/errors across modules."""
+
+    event_log = run_dir / "events.log"
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if isinstance(handler, logging.FileHandler) and getattr(handler, "_spider_events", False):
+            return
+
+    file_handler = logging.FileHandler(event_log, encoding="utf-8")
+    file_handler.setLevel(logging.WARNING)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    setattr(file_handler, "_spider_events", True)
+    root.addHandler(file_handler)
+    print(f"[log] compact warning/error log: {event_log}")
+
+
+def _install_raw_logger(run_dir: Path) -> None:
+    """Optionally keep a full raw logger output for post-mortem analysis."""
+
+    if not _env_true("SPIDER_SAVE_RAW_LOG", default=False):
+        return
+
+    level_name = os.getenv("SPIDER_RAW_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    raw_log = run_dir / "raw.log"
+
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if isinstance(handler, logging.FileHandler) and getattr(handler, "_spider_raw", False):
+            return
+
+    file_handler = logging.FileHandler(raw_log, encoding="utf-8")
+    file_handler.setLevel(level)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    setattr(file_handler, "_spider_raw", True)
+    root.addHandler(file_handler)
+
+    if root.level > level:
+        root.setLevel(level)
+    print(f"[log] raw logger enabled: {raw_log} (level={logging.getLevelName(level)})")
+
+
+def _configure_ray_tmpdir(run_dir: Path, run_name: str) -> None:
+    """Pin Ray session/log/temp files to a stable path (prefer external disk)."""
+
+    configured_tmp = os.getenv("RAY_TMPDIR")
+    if configured_tmp:
+        ray_tmpdir = Path(configured_tmp).expanduser()
+    else:
+        ray_root = os.getenv("SPIDER_RAY_ROOT")
+        if not ray_root:
+            return
+        ray_tmpdir = Path(ray_root).expanduser() / f"{run_name}_pid{os.getpid()}"
+
+    ray_tmpdir.mkdir(parents=True, exist_ok=True)
+    os.environ["RAY_TMPDIR"] = str(ray_tmpdir)
+    if _env_true("SPIDER_SYNC_TMPDIR_WITH_RAY", default=True):
+        os.environ["TMPDIR"] = str(ray_tmpdir)
+
+    _write_text(
+        run_dir / "ray_paths.txt",
+        f"RAY_TMPDIR={os.environ.get('RAY_TMPDIR', '')}\nTMPDIR={os.environ.get('TMPDIR', '')}\n",
+    )
+    print(f"[ray] RAY_TMPDIR={os.environ.get('RAY_TMPDIR')}")
+
+
+def _write_final_status(run_dir: Path, status: str, message: str = "") -> None:
+    payload = {
+        "status": status,
+        "message": message,
+        "timestamp": datetime.now().isoformat(),
+    }
+    _write_text(run_dir / "final_status.json", json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
+
+
+def _apply_guidance_overrides(config: Dict[str, Any], args: argparse.Namespace) -> None:
+    guidance_cfg: Dict[str, Any] = {}
+    if args.round is not None:
+        guidance_cfg["round"] = args.round
+    if args.hard_samples:
+        guidance_cfg["hard_samples"] = args.hard_samples
+    if args.guidance:
+        guidance_cfg["guidance"] = args.guidance
+    if args.ignite:
+        guidance_cfg["ignite"] = args.ignite
+    if args.raw_success_state:
+        guidance_cfg["raw_success_state"] = args.raw_success_state
+    if args.p_guided is not None:
+        guidance_cfg["p_guided"] = args.p_guided
+    if guidance_cfg:
+        config["agentlightning_guidance"] = guidance_cfg
 
 
 def collect_hardware_snapshot(run_dir: Path) -> None:
@@ -370,6 +566,15 @@ def _apply_passk_overrides(config: Dict[str, Any], args: argparse.Namespace) -> 
     """Inject Pass@k curriculum options into the config."""
 
     algo = config.setdefault("algorithm", {})
+    rollout_cfg = config.setdefault("actor_rollout_ref", {}).setdefault("rollout", {})
+
+    # Allow strict GRPO baseline runs that keep the rest of the config unchanged.
+    if args.adv_estimator == "grpo":
+        algo["adv_estimator"] = "grpo"
+        if args.rollout_n is not None:
+            rollout_cfg["n"] = args.rollout_n
+        return
+
     algo["adv_estimator"] = "grpo_passk_seed"
     algo.setdefault("norm_adv_by_std_in_grpo", algo.get("passk_norm_by_std", True))
     algo.setdefault("passk_norm_by_std", algo.get("norm_adv_by_std_in_grpo", True))
@@ -405,7 +610,6 @@ def _apply_passk_overrides(config: Dict[str, Any], args: argparse.Namespace) -> 
     if args.stage == 2 and args.passk_mode is None:
         algo["passk_mode"] = "analytic"
 
-    rollout_cfg = config.setdefault("actor_rollout_ref", {}).setdefault("rollout", {})
     if args.rollout_n is not None:
         rollout_cfg["n"] = args.rollout_n
     elif args.stage == 1:
@@ -491,15 +695,17 @@ def config_train_llama() -> Dict[str, Any]:
 def prepare_run_outputs(config: Dict[str, Any], run_label: str) -> Path:
     """Create per-run folder and inject log/config paths into the config."""
 
-    log_dir = Path(__file__).resolve().parent / "log"
+    log_dir = _resolve_run_root()
     log_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_label = run_label.replace("/", "_")
     safe_run_name = f"{timestamp}_config_{base_label}"
+    _rewrite_checkpoint_root(config, safe_run_name)
 
     run_dir = log_dir / safe_run_name
     run_dir.mkdir(parents=True, exist_ok=True)
+    _configure_ray_tmpdir(run_dir, safe_run_name)
 
     progress_log = run_dir / "progress.txt"
     config_dump = run_dir / "config.json"
@@ -547,6 +753,10 @@ def train(config: Dict[str, Any], active_agent: Optional[str]) -> None:
     # 检查关闭标志
     check_shutdown_flag()
     
+    if config.get("agentlightning_guidance"):
+        print("[Guidance] Detected agentlightning_guidance config; guidance will be embedded in prompt template (simplified approach).")
+    # Always use fit() method - guidance is handled by embedding in prompt template,
+    # no longer requires v0 proxy for suffix segmentation
     trainer.fit(agent, train_dataset=train_data, val_dataset=val_data)  # type: ignore
 
 
@@ -609,10 +819,47 @@ def main() -> None:
         help="Override actor_rollout_ref.rollout.n (number of rollouts per prompt). Stage1 will auto-bump to >=8 if unset.",
     )
     parser.add_argument(
+        "--adv-estimator",
+        choices=["grpo_passk_seed", "grpo"],
+        default="grpo_passk_seed",
+        help="Use grpo_passk_seed (default) or strict grpo baseline.",
+    )
+    parser.add_argument(
         "--resume-ckpt",
         type=str,
         default=None,
         help="Resume from a checkpoint (useful for stage2 after saving stage1).",
+    )
+    parser.add_argument("--round", type=int, default=None, help="Training round index for guidance schedule.")
+    parser.add_argument(
+        "--hard-samples",
+        type=str,
+        default=None,
+        help="Path to round_r_hard_samples.jsonl (raw-only hard mining output).",
+    )
+    parser.add_argument(
+        "--guidance",
+        type=str,
+        default=None,
+        help="Path to round_r_guidance.jsonl (guidance bodies).",
+    )
+    parser.add_argument(
+        "--ignite",
+        type=str,
+        default=None,
+        help="Optional path to round_r_ignite.jsonl (min_level decisions).",
+    )
+    parser.add_argument(
+        "--raw-success-state",
+        type=str,
+        default=None,
+        help="Path to raw_success_state.roundXXX.json (read-only).",
+    )
+    parser.add_argument(
+        "--p-guided",
+        type=float,
+        default=None,
+        help="Override per-round p_guided (default uses round schedule).",
     )
 
     parser.add_argument(
@@ -624,8 +871,37 @@ def main() -> None:
         default=None,
         help="Optional JSON/YAML config file to load (relative paths resolved from this script).",
     )
+    parser.add_argument(
+        "--total-epochs",
+        type=int,
+        default=None,
+        help="Optional override for trainer.total_epochs.",
+    )
+    parser.add_argument(
+        "--total-training-steps",
+        type=int,
+        default=None,
+        help="Optional override for trainer.total_training_steps.",
+    )
+    parser.add_argument(
+        "--agentlightning-port",
+        type=int,
+        default=None,
+        help="Override agentlightning.port for this run (useful for parallel jobs).",
+    )
 
     args = parser.parse_args()
+    guidance_args_set = any(
+        [
+            args.hard_samples,
+            args.guidance,
+            args.ignite,
+            args.raw_success_state,
+            args.p_guided is not None,
+        ]
+    )
+    if guidance_args_set and args.round is None:
+        raise ValueError("Guidance inputs require --round to be specified.")
 
     # Get the appropriate configuration
     config_functions = {
@@ -648,7 +924,18 @@ def main() -> None:
     else:
         config = config_functions[args.config]()
     _apply_passk_overrides(config, args)
+    _apply_guidance_overrides(config, args)
+    if args.total_epochs is not None:
+        config.setdefault("trainer", {})["total_epochs"] = args.total_epochs
+    if args.total_training_steps is not None:
+        config.setdefault("trainer", {})["total_training_steps"] = args.total_training_steps
+    if args.agentlightning_port is not None:
+        config.setdefault("agentlightning", {})["port"] = args.agentlightning_port
+        print(f"[port] agentlightning.port={args.agentlightning_port}")
+    _apply_runtime_stability_overrides(config)
     run_dir = prepare_run_outputs(config, run_label)
+    _install_warning_error_logger(run_dir)
+    _install_raw_logger(run_dir)
 
     # Set active agent - use provided value or default based on config choice
     active_agent = args.active_agent
@@ -658,9 +945,14 @@ def main() -> None:
 
     try:
         train(config, active_agent)
+        _write_final_status(Path(run_dir), "completed", "train() returned successfully.")
+    except KeyboardInterrupt as exc:
+        _write_final_status(Path(run_dir), "interrupted", str(exc))
+        raise
     except Exception as exc:  # noqa: BLE001
         error_path = Path(run_dir) / "error.txt"
-        _write_text(error_path, f"exception: {exc}\n")
+        _write_text(error_path, f"exception: {exc}\n\ntraceback:\n{traceback.format_exc()}\n")
+        _write_final_status(Path(run_dir), "error", str(exc))
         raise
 
 

@@ -1,7 +1,9 @@
 # Copyright (c) Microsoft. All rights reserved.
 
 import asyncio
+import hashlib
 import json
+import logging
 import random
 import socket
 import threading
@@ -29,6 +31,9 @@ __all__ = [
     "get_left_padded_ids_and_attention_mask",
     "get_right_padded_ids_and_attention_mask",
 ]
+
+
+logger = logging.getLogger(__name__)
 
 
 def get_left_padded_ids_and_attention_mask(
@@ -287,6 +292,41 @@ class AgentModeDaemon:
 
         num_requests = 0
         last_request_time = 0
+        stats = defaultdict(int)
+        stats_lock = threading.Lock()
+        raw_truncation_state = {"checked": False, "enabled": False, "mode": None}
+        raw_truncation_lock = threading.Lock()
+        guidance_markers = {
+            "[AGL_GUIDANCE_L1]": {"level": "L1", "budget": 128},
+            "[AGL_GUIDANCE_L2]": {"level": "L2", "budget": 256},
+        }
+        call_tag = "CALL_TAG=WRITE"
+        max_trim_iters = 8
+
+        model_path = getattr(self.tokenizer, "name_or_path", "unknown")
+        revision = getattr(self.tokenizer, "revision", None)
+        init_kwargs = getattr(self.tokenizer, "init_kwargs", {})
+        if revision is None and isinstance(init_kwargs, dict):
+            revision = init_kwargs.get("revision")
+        chat_template = getattr(self.tokenizer, "chat_template", None)
+        chat_template_hash = (
+            hashlib.sha256(chat_template.encode("utf-8")).hexdigest() if chat_template is not None else "unknown"
+        )
+        logger.info(
+            "Proxy tokenizer: model_path=%s revision=%s chat_template_hash=%s",
+            model_path,
+            revision,
+            chat_template_hash,
+        )
+
+        def split_guidance_content(content: str) -> tuple[str, str, str] | None:
+            parts = content.split("\n", 2)
+            if len(parts) < 2:
+                return None
+            marker_line = parts[0]
+            call_tag_line = parts[1]
+            body_text = parts[2] if len(parts) == 3 else ""
+            return marker_line, call_tag_line, body_text
 
         @app.route("/v1/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
         def proxy(path: str):  # type: ignore
@@ -305,17 +345,221 @@ class AgentModeDaemon:
             current_time = time.time()
             num_requests += 1
             if current_time - last_request_time > 60 or num_requests == 1 or num_requests % 100 == 0:
-                print(f"Proxying {request.method} request to {target_server}. Request data: {request.get_data()}")
+                with stats_lock:
+                    stats_snapshot = dict(stats)
+                logger.info(
+                    "Proxying %s request to %s. Request data: %s Stats: %s",
+                    request.method,
+                    target_server,
+                    request.get_data(),
+                    stats_snapshot,
+                )
             last_request_time = current_time
 
             try:
+                request_data = request.get_data()
+                request_json: Dict[str, Any] | None = None
+                try:
+                    request_json = json.loads(request_data.decode("utf-8"))
+                except Exception:
+                    request_json = None
+
+                raw_messages: List[Dict[str, Any]] | None = None
+                raw_full_ids: List[int] | None = None
+                is_guided_write = False
+                guidance_budget: int | None = None
+                guidance_marker: str | None = None
+                guidance_message: Dict[str, Any] | None = None
+                tool_schemas = None
+                baseline_check_ids: List[int] | None = None
+                raw_truncation_enabled = False
+
+                if request_json and isinstance(request_json.get("messages"), list):
+                    messages = request_json["messages"]
+                    tool_schemas = request_json.get("tools", None)
+                    if messages:
+                        last_message = messages[-1]
+                        content = last_message.get("content") if isinstance(last_message, dict) else None
+                        if isinstance(content, str):
+                            split = split_guidance_content(content)
+                            if split is not None:
+                                marker_line, call_tag_line, body_text = split
+                                marker_config = guidance_markers.get(marker_line)
+                                if marker_config and call_tag_line == call_tag:
+                                    is_guided_write = True
+                                    guidance_budget = marker_config["budget"]
+                                    guidance_marker = marker_line
+                                    guidance_message = dict(last_message)
+                                    raw_messages = list(messages[:-1])
+
+                    if not is_guided_write:
+                        raw_messages = list(messages)
+
+                if is_guided_write and raw_messages is not None and guidance_message is not None:
+                    with stats_lock:
+                        stats["n_guided_write_seen"] += 1
+                    with raw_truncation_lock:
+                        baseline_checked = raw_truncation_state["checked"]
+                        raw_truncation_enabled = raw_truncation_state["enabled"]
+                    if not baseline_checked or not raw_truncation_enabled:
+                        with stats_lock:
+                            key = (
+                                "n_guided_blocked_no_baseline"
+                                if not baseline_checked
+                                else "n_guided_blocked_baseline_mismatch"
+                            )
+                            stats[key] += 1
+                        if not baseline_checked:
+                            logger.warning("Guidance blocked before baseline check; degrading to raw.")
+                        else:
+                            logger.error("Guidance blocked due to baseline mismatch; degrading to raw.")
+                        request_json["messages"] = raw_messages
+                        if raw_truncation_enabled:
+                            request_json["truncate_prompt_tokens"] = 4096
+                        else:
+                            request_json.pop("truncate_prompt_tokens", None)
+                        if not baseline_checked:
+                            try:
+                                raw_full_ids = self.tokenizer.apply_chat_template(
+                                    raw_messages,
+                                    add_generation_prompt=True,
+                                    tokenize=True,
+                                    tools=tool_schemas,
+                                )
+                                if len(raw_full_ids) > 4096 and not request_json.get("stream", False):
+                                    baseline_check_ids = raw_full_ids
+                            except Exception as e:
+                                logger.error("Failed to compute raw baseline tokens: %s", e)
+                        request_data = json.dumps(request_json).encode("utf-8")
+                    else:
+                        try:
+                            raw_body_ids = self.tokenizer.apply_chat_template(
+                                raw_messages,
+                                add_generation_prompt=False,
+                                tokenize=True,
+                                tools=tool_schemas,
+                            )
+                            full_ids = self.tokenizer.apply_chat_template(
+                                raw_messages + [guidance_message],
+                                add_generation_prompt=True,
+                                tokenize=True,
+                                tools=tool_schemas,
+                            )
+                            suffix_ids = full_ids[len(raw_body_ids) :]
+                            suffix_len = len(suffix_ids)
+                            if guidance_budget is None:
+                                raise ValueError("Guidance budget missing.")
+
+                            if suffix_len <= guidance_budget:
+                                request_json["truncate_prompt_tokens"] = 4096 + suffix_len
+                                request_data = json.dumps(request_json).encode("utf-8")
+                            else:
+                                with stats_lock:
+                                    stats["n_suffix_oversize"] += 1
+                                body_text = split_guidance_content(guidance_message.get("content", "")) or ("", "", "")
+                                _, _, guidance_body = body_text
+                                body_ids = self.tokenizer.encode(guidance_body, add_special_tokens=False)
+                                target_len = len(body_ids)
+                                trimmed_to_fit = False
+                                for _ in range(max_trim_iters):
+                                    trimmed_ids = body_ids[:target_len]
+                                    trimmed_body = self.tokenizer.decode(trimmed_ids, skip_special_tokens=True).strip()
+                                    new_content = f"{guidance_marker}\n{call_tag}\n{trimmed_body}"
+                                    updated_guidance = dict(guidance_message)
+                                    updated_guidance["content"] = new_content
+                                    full_ids = self.tokenizer.apply_chat_template(
+                                        raw_messages + [updated_guidance],
+                                        add_generation_prompt=True,
+                                        tokenize=True,
+                                        tools=tool_schemas,
+                                    )
+                                    suffix_ids = full_ids[len(raw_body_ids) :]
+                                    if len(suffix_ids) <= guidance_budget:
+                                        request_json["messages"] = raw_messages + [updated_guidance]
+                                        request_json["truncate_prompt_tokens"] = 4096 + len(suffix_ids)
+                                        request_data = json.dumps(request_json).encode("utf-8")
+                                        trimmed_to_fit = True
+                                        with stats_lock:
+                                            stats["n_oversize_trimmed_to_fit"] += 1
+                                        break
+                                    if target_len <= 0:
+                                        break
+                                    reduced_target = max(0, int(target_len * 0.7))
+                                    target_len = min(reduced_target, target_len - 1)
+
+                                if not trimmed_to_fit:
+                                    empty_body_content = f"{guidance_marker}\n{call_tag}\n"
+                                    empty_guidance = dict(guidance_message)
+                                    empty_guidance["content"] = empty_body_content
+                                    full_ids = self.tokenizer.apply_chat_template(
+                                        raw_messages + [empty_guidance],
+                                        add_generation_prompt=True,
+                                        tokenize=True,
+                                        tools=tool_schemas,
+                                    )
+                                    empty_suffix_len = len(full_ids[len(raw_body_ids) :])
+                                    with stats_lock:
+                                        stats["n_oversize_degraded_to_raw"] += 1
+                                    rollout_id = request.headers.get("x-rollout-id")
+                                    attempt_id = request.headers.get("x-attempt-id")
+                                    logger.error(
+                                        "Guidance oversize degraded to raw. marker=%s budget=%s "
+                                        "suffix_len_when_body_empty=%s tools_enabled=%s tools_count=%s",
+                                        guidance_marker,
+                                        guidance_budget,
+                                        empty_suffix_len,
+                                        bool(tool_schemas),
+                                        len(tool_schemas) if isinstance(tool_schemas, list) else 0,
+                                    )
+                                    logger.error(
+                                        "Guidance oversize context. call_tag=%s route=%s rollout_id=%s attempt_id=%s",
+                                        call_tag,
+                                        request.path,
+                                        rollout_id,
+                                        attempt_id,
+                                    )
+                                    request_json["messages"] = raw_messages
+                                    if raw_truncation_enabled:
+                                        request_json["truncate_prompt_tokens"] = 4096
+                                    else:
+                                        request_json.pop("truncate_prompt_tokens", None)
+                                    request_data = json.dumps(request_json).encode("utf-8")
+                        except Exception as e:
+                            logger.error("Failed to apply guidance segmentation: %s", e)
+                            if request_json and raw_messages is not None:
+                                request_json["messages"] = raw_messages
+                                if raw_truncation_enabled:
+                                    request_json["truncate_prompt_tokens"] = 4096
+                                else:
+                                    request_json.pop("truncate_prompt_tokens", None)
+                                request_data = json.dumps(request_json).encode("utf-8")
+                elif request_json and raw_messages is not None:
+                    with raw_truncation_lock:
+                        raw_truncation_enabled = raw_truncation_state["enabled"]
+                        raw_checked = raw_truncation_state["checked"]
+                    if raw_truncation_enabled:
+                        request_json["truncate_prompt_tokens"] = 4096
+                        request_data = json.dumps(request_json).encode("utf-8")
+                    elif not raw_checked:
+                        try:
+                            raw_full_ids = self.tokenizer.apply_chat_template(
+                                raw_messages,
+                                add_generation_prompt=True,
+                                tokenize=True,
+                                tools=tool_schemas,
+                            )
+                            if len(raw_full_ids) > 4096 and not request_json.get("stream", False):
+                                baseline_check_ids = raw_full_ids
+                        except Exception as e:
+                            logger.error("Failed to compute raw baseline tokens: %s", e)
+
                 # Forward the request to the target backend
                 resp = requests.request(
                     method=request.method,
                     url=target_url,
                     headers=headers,
                     params=request.args,  # type: ignore
-                    data=request.get_data(),
+                    data=request_data,
                     cookies=request.cookies,
                     allow_redirects=False,
                     timeout=self.llm_timeout_seconds,
@@ -341,6 +585,27 @@ class AgentModeDaemon:
                     # https://github.com/hzy46/verl_agent_mode/blob/2db65ea9858f645a914120357412a7540f8bd82d/verl/trainer/ppo/ray_trainer.py#L692-L711
                     # request_json = json.loads(request.get_data().decode("utf-8"))
                     response_json = json.loads(resp.content.decode("utf-8"))
+                    if baseline_check_ids is not None:
+                        prompt_token_ids = response_json.get("prompt_token_ids")
+                        if isinstance(prompt_token_ids, list):
+                            expected_tail = baseline_check_ids[-4096:]
+                            expected_head = baseline_check_ids[:4096]
+                            matches_tail = prompt_token_ids == expected_tail
+                            matches_head = prompt_token_ids == expected_head
+                            with raw_truncation_lock:
+                                raw_truncation_state["checked"] = True
+                                raw_truncation_state["enabled"] = matches_tail
+                                raw_truncation_state["mode"] = (
+                                    "tail" if matches_tail else "head" if matches_head else "unknown"
+                                )
+                            if not matches_tail:
+                                with stats_lock:
+                                    stats["n_suffix_consistency_mismatch"] += 1
+                                logger.error(
+                                    "Raw truncation baseline mismatch. mode=%s prompt_len=%s",
+                                    raw_truncation_state["mode"],
+                                    len(prompt_token_ids),
+                                )
                     # response_message = ChatCompletion(**response_json).choices[0].message.model_dump(exclude_unset=True, exclude_none=True)
                     # tool_schemas = request_json.get("tools", None)
                     # prompt_ids = self.tokenizer.apply_chat_template(request_json["messages"], tools=tool_schemas, add_generation_prompt=True, tokenize=True)
