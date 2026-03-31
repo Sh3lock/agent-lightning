@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-# Activate conda environment
+# Activate conda environment when available
 if command -v conda &> /dev/null; then
     CONDA_BASE="$(conda info --base)"
 elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
@@ -17,13 +17,18 @@ else
     echo "Error: conda not found and no conda.sh in \$HOME/anaconda3 or \$HOME/miniconda3."
     exit 1
 fi
-# shellcheck source=/dev/null
-source "$CONDA_BASE/etc/profile.d/conda.sh"
-conda activate ltf_agent
+
+if [[ -n "${VLLM_CONDA_ENV:-}" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONDA_BASE/etc/profile.d/conda.sh"
+    conda activate "$VLLM_CONDA_ENV"
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Paths
-VLLM_PATH="/home/storage/wenbinxing/ltf/passk/vllm"
-MODEL_PATH="/home/storage/wenbinxing/ltf/model/Qwen2.5-Coder-0.5B-Instruct"
+VLLM_PATH="${VLLM_PATH:-}"
+MODEL_PATH="${MODEL_PATH:-${SPIDER_MODEL_PATH:-Qwen/Qwen2.5-Coder-0.5B-Instruct}}"
 
 # --- GPU Configuration ---
 : "${CUDA_VISIBLE_DEVICES:=0}"  # Override before running if needed
@@ -52,9 +57,9 @@ GPU_MEMORY_UTILIZATION=0.90
 #    If your inputs are long, ensure this covers them.
 MAX_MODEL_LEN=8192
 
-HOST="0.0.0.0"
-PORT="8001"
-SERVED_MODEL_NAME="qwen2.5-coder-0.5b-instruct"
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-8001}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen2.5-coder-0.5b-instruct}"
 
 echo "========================================"
 echo "Qwen2.5-Coder-0.5B 48GB EXTREME DEPLOYMENT"
@@ -67,12 +72,12 @@ echo "GPU Memory Utilization: $GPU_MEMORY_UTILIZATION"
 echo "========================================"
 
 # Check if required directories exist
-if [ ! -d "$VLLM_PATH" ]; then
+if [[ -n "$VLLM_PATH" ]] && [ ! -d "$VLLM_PATH" ]; then
     echo "Error: vLLM directory not found at $VLLM_PATH"
     exit 1
 fi
 
-if [ ! -d "$MODEL_PATH" ]; then
+if [[ "$MODEL_PATH" == /* ]] && [ ! -d "$MODEL_PATH" ]; then
     echo "Error: Model directory not found at $MODEL_PATH"
     exit 1
 fi
@@ -88,7 +93,9 @@ echo "Starting vLLM server..."
 echo "Running in high-throughput mode..."
 echo ""
 
-export PYTHONPATH="$VLLM_PATH:${PYTHONPATH:-}"
+if [[ -n "$VLLM_PATH" ]]; then
+    export PYTHONPATH="$VLLM_PATH:${PYTHONPATH:-}"
+fi
 
 python -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_PATH" \

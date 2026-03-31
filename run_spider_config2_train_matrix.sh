@@ -7,10 +7,11 @@
 
 set -euo pipefail
 
-ARTIFACT_ROOT="${ARTIFACT_ROOT:-/home/storage/wenbinxing/ltf}"
-RAY_TMPDIR_FALLBACK_BASE="${RAY_TMPDIR_FALLBACK_BASE:-/home/storage/wenbinxing/ltf/tmp}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ARTIFACT_ROOT="${ARTIFACT_ROOT:-$SCRIPT_DIR/.artifacts}"
+RAY_TMPDIR_FALLBACK_BASE="${RAY_TMPDIR_FALLBACK_BASE:-$ARTIFACT_ROOT/tmp_fallback}"
 if [[ -z "${RAY_TMPDIR_BASE:-}" ]]; then
-  default_ray_tmp="$ARTIFACT_ROOT/tmp"
+  default_ray_tmp="$ARTIFACT_ROOT/passk/tmp"
   fs_use="$(df -P "$ARTIFACT_ROOT" 2>/dev/null | awk 'NR==2 {gsub("%", "", $5); print $5}')"
   if [[ -n "$fs_use" && "$fs_use" -ge 95 ]]; then
     RAY_TMPDIR_BASE="$RAY_TMPDIR_FALLBACK_BASE"
@@ -21,16 +22,24 @@ fi
 MODE="${MODE:-smoke}"                 # smoke | full
 RUN_SET="${RUN_SET:-grpo,passk,guided}"
 RUN_PARALLEL="${RUN_PARALLEL:-0}"     # 0 sequential, 1 background
-PYTHON_BIN="${PYTHON_BIN:-/home/wenbinxing/anaconda3/envs/ltf_agent/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 VLLM_USE_V1="${VLLM_USE_V1:-1}"
 SPIDER_USE_REMOVE_PADDING="${SPIDER_USE_REMOVE_PADDING:-0}"
 SPIDER_USE_TORCH_COMPILE="${SPIDER_USE_TORCH_COMPILE:-1}"
 SPIDER_LOGPROB_MICRO_BATCH_SIZE_PER_GPU="${SPIDER_LOGPROB_MICRO_BATCH_SIZE_PER_GPU:-}"
 SPIDER_SAFE_LOGPROB_MB_WHEN_DENSE="${SPIDER_SAFE_LOGPROB_MB_WHEN_DENSE:-4}"
 SPIDER_ROLLOUT_GPU_MEMORY_UTILIZATION="${SPIDER_ROLLOUT_GPU_MEMORY_UTILIZATION:-}"
+ROLLOUT_N="${ROLLOUT_N:-}"
 CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-0}"
 RAY_DISABLE_DASHBOARD="${RAY_DISABLE_DASHBOARD:-1}"
 RAY_LOCAL_FS_CAPACITY_THRESHOLD="${RAY_LOCAL_FS_CAPACITY_THRESHOLD:-0.99}"
+RAY_RAYLET_START_WAIT_TIME_S="${RAY_RAYLET_START_WAIT_TIME_S:-180}"
+LOCAL_NO_PROXY_DEFAULT="localhost,127.0.0.1,::1"
+if [[ -n "${NO_PROXY:-}" ]]; then
+  PROXY_NO_PROXY="${NO_PROXY},${LOCAL_NO_PROXY_DEFAULT}"
+else
+  PROXY_NO_PROXY="$LOCAL_NO_PROXY_DEFAULT"
+fi
 
 BASE_STORE_PORT="${BASE_STORE_PORT:-4747}"
 BASE_AGENT_PORT="${BASE_AGENT_PORT:-9999}"
@@ -43,7 +52,6 @@ ROUND="${ROUND:-0}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/round0_full}"
 P_GUIDED="${P_GUIDED:-}"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPIDER_DIR="$SCRIPT_DIR/examples/spider"
 CONFIG_REL="configs/passk_stage1_qwen05b_config2_2epochs.json"
 CONFIG_ABS="$SPIDER_DIR/$CONFIG_REL"
@@ -64,6 +72,9 @@ elif [[ "$MODE" != "full" ]]; then
   echo "unsupported MODE: $MODE (expected smoke/full)"
   exit 1
 fi
+if [[ -n "$ROLLOUT_N" ]]; then
+  COMMON_ARGS+=(--rollout-n "$ROLLOUT_N")
+fi
 
 contains() {
   local token="$1"
@@ -77,9 +88,9 @@ start_run() {
   shift 3
   local -a extra_args=("$@")
 
-  local run_root="$ARTIFACT_ROOT/passk/agent-lightning/examples/spider/log/$run_name"
-  local ckpt_root="$ARTIFACT_ROOT/passk/agent-lightning/examples/spider/ckpt/$run_name"
-  local ray_root="$ARTIFACT_ROOT/passk/agent-lightning/examples/spider/ray/$run_name"
+  local run_root="$ARTIFACT_ROOT/examples/spider/log/$run_name"
+  local ckpt_root="$ARTIFACT_ROOT/examples/spider/ckpt/$run_name"
+  local ray_root="$ARTIFACT_ROOT/examples/spider/ray/$run_name"
   mkdir -p "$run_root" "$ckpt_root" "$ray_root" "$RAY_TMPDIR_BASE"
   local store_port=$((BASE_STORE_PORT + port_offset))
   local agent_port=$((BASE_AGENT_PORT + port_offset))
@@ -133,9 +144,11 @@ start_run() {
     echo "SPIDER_LOGPROB_MICRO_BATCH_SIZE_PER_GPU: ${SPIDER_LOGPROB_MICRO_BATCH_SIZE_PER_GPU:-<unset>}"
     echo "SPIDER_SAFE_LOGPROB_MB_WHEN_DENSE: $SPIDER_SAFE_LOGPROB_MB_WHEN_DENSE"
     echo "SPIDER_ROLLOUT_GPU_MEMORY_UTILIZATION: ${SPIDER_ROLLOUT_GPU_MEMORY_UTILIZATION:-<unset>}"
+    echo "ROLLOUT_N: ${ROLLOUT_N:-<unset>}"
     echo "CUDA_LAUNCH_BLOCKING: $CUDA_LAUNCH_BLOCKING"
     echo "RAY_DISABLE_DASHBOARD: $RAY_DISABLE_DASHBOARD"
     echo "RAY_LOCAL_FS_CAPACITY_THRESHOLD: $RAY_LOCAL_FS_CAPACITY_THRESHOLD"
+    echo "RAY_raylet_start_wait_time_s: $RAY_RAYLET_START_WAIT_TIME_S"
     echo "git_branch: $(git -C "$SCRIPT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
     echo "git_commit: $(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "cmd: ${cmd[*]}"
@@ -163,10 +176,19 @@ start_run() {
         RAY_DISABLE_DASHBOARD="$RAY_DISABLE_DASHBOARD" \
         RAY_LOCAL_FS_CAPACITY_THRESHOLD="$RAY_LOCAL_FS_CAPACITY_THRESHOLD" \
         RAY_local_fs_capacity_threshold="$RAY_LOCAL_FS_CAPACITY_THRESHOLD" \
+        RAY_raylet_start_wait_time_s="$RAY_RAYLET_START_WAIT_TIME_S" \
         RAY_DATA_DISK_USAGE_THRESHOLD=0.99 \
         RAY_CHDIR_TO_TEMPDIR=1 \
         RAY_TMPDIR="$ray_tmp" \
         TMPDIR="$ray_tmp" \
+        NO_PROXY="$PROXY_NO_PROXY" \
+        no_proxy="$PROXY_NO_PROXY" \
+        HTTP_PROXY= \
+        HTTPS_PROXY= \
+        ALL_PROXY= \
+        http_proxy= \
+        https_proxy= \
+        all_proxy= \
         PYTHONUNBUFFERED=1 \
         AGL_SERVER_PORT="$store_port" \
         CUDA_VISIBLE_DEVICES="$gpu" \
@@ -197,10 +219,19 @@ start_run() {
         RAY_DISABLE_DASHBOARD="$RAY_DISABLE_DASHBOARD" \
         RAY_LOCAL_FS_CAPACITY_THRESHOLD="$RAY_LOCAL_FS_CAPACITY_THRESHOLD" \
         RAY_local_fs_capacity_threshold="$RAY_LOCAL_FS_CAPACITY_THRESHOLD" \
+        RAY_raylet_start_wait_time_s="$RAY_RAYLET_START_WAIT_TIME_S" \
         RAY_DATA_DISK_USAGE_THRESHOLD=0.99 \
         RAY_CHDIR_TO_TEMPDIR=1 \
         RAY_TMPDIR="$ray_tmp" \
         TMPDIR="$ray_tmp" \
+        NO_PROXY="$PROXY_NO_PROXY" \
+        no_proxy="$PROXY_NO_PROXY" \
+        HTTP_PROXY= \
+        HTTPS_PROXY= \
+        ALL_PROXY= \
+        http_proxy= \
+        https_proxy= \
+        all_proxy= \
         PYTHONUNBUFFERED=1 \
         AGL_SERVER_PORT="$store_port" \
         CUDA_VISIBLE_DEVICES="$gpu" \
@@ -248,5 +279,5 @@ fi
 
 if [[ "$RUN_PARALLEL" == "1" ]]; then
   echo "all requested runs are in background"
-  echo "check logs under: $ARTIFACT_ROOT/passk/agent-lightning/examples/spider/log"
+  echo "check logs under: $ARTIFACT_ROOT/examples/spider/log"
 fi

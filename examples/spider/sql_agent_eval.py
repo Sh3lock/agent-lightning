@@ -40,12 +40,42 @@ import agentlightning as agl
 
 logger = logging.getLogger(__name__)
 
+_CONTEXT_WINDOW_RE = re.compile(
+    r"maximum context length is (?P<context>\d+) tokens and your request has (?P<input>\d+) input tokens",
+    re.IGNORECASE,
+)
+
 # Default knobs for convenience; change here to adjust global defaults.
 DEFAULT_MODE = "eval"  # "debug" or "eval"
 DEFAULT_NUM_SAMPLES = -1  # use -1 to mean "all samples"
 DEFAULT_OUTPUT_PATH = "outputs/qwen3-4b-dev.jsonl"  # e.g., "outputs/qwen3-4b-dev.jsonl"
 DEFAULT_USE_TEST_SPLIT = False
 DEFAULT_CONCURRENCY = 4
+
+
+def _extract_safe_retry_max_tokens(
+    error: Exception | str,
+    *,
+    requested_max_tokens: int = 2048,
+    reserve_tokens: int = 16,
+    min_retry_tokens: int = 32,
+) -> int | None:
+    """Parse context-window errors and derive a smaller max_tokens budget.
+
+    Example error:
+    "... maximum context length is 6144 tokens and your request has 5359 input tokens ..."
+    """
+    message = str(error)
+    match = _CONTEXT_WINDOW_RE.search(message)
+    if not match:
+        return None
+
+    context_window = int(match.group("context"))
+    input_tokens = int(match.group("input"))
+    available = context_window - input_tokens - reserve_tokens
+    if available < min_retry_tokens:
+        return None
+    return min(requested_max_tokens, available)
 
 
 def _load_env_from_file(env_path: str) -> None:
@@ -314,8 +344,21 @@ class SQLAgent:
             result = self.llm.invoke(prompt)
         except Exception as e:
             logger.error(f"Failed to invoke prompt: {e}")
-            # FIXME: fallback to create a random trajectory
-            result = self.llm.invoke([HumanMessage(content="Please create a random SQL query as an example.")])
+            retry_max_tokens = _extract_safe_retry_max_tokens(e)
+            if retry_max_tokens is not None:
+                logger.warning(
+                    "Retrying prompt with reduced max_tokens=%s after context window error.",
+                    retry_max_tokens,
+                )
+                try:
+                    result = self.llm.bind(max_tokens=retry_max_tokens).invoke(prompt)
+                except Exception as retry_error:
+                    logger.error(f"Retry with reduced max_tokens failed: {retry_error}")
+                    # FIXME: fallback to create a random trajectory
+                    result = self.llm.invoke([HumanMessage(content="Please create a random SQL query as an example.")])
+            else:
+                # FIXME: fallback to create a random trajectory
+                result = self.llm.invoke([HumanMessage(content="Please create a random SQL query as an example.")])
 
         if self.debug:
             termcolor.cprint(result.pretty_repr(), "green")

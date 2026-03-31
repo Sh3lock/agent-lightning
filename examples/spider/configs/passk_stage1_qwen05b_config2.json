@@ -60,7 +60,7 @@
       }
     },
     "model": {
-      "path": "/home/storage/wenbinxing/ltf/model/Qwen2.5-Coder-0.5B-Instruct",
+      "path": "Qwen/Qwen2.5-Coder-0.5B-Instruct",
       "use_remove_padding": true,
       "enable_gradient_checkpointing": true,
       "dtype": "bfloat16"
@@ -78,6 +78,6 @@
     "total_epochs": 1,
     "log_interval": 1,
     "save_freq": 0,
-    "default_local_dir": "/home/storage/wenbinxing/ltf/passk/agent-lightning/examples/spider/ckpt_passk_stage1_1220_config2"
+    "default_local_dir": ".artifacts/examples/spider/ckpt/passk_stage1_config2"
   }
 }

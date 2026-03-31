@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import os
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Type
 
 import hydra
@@ -30,6 +32,72 @@ __all__ = [
     "run_ppo",
     "TaskRunner",
 ]
+
+
+def _read_optional_int_env(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got: {raw!r}") from exc
+
+
+def _read_optional_bool_env(name: str) -> bool | None:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean-like value, got: {raw!r}")
+
+
+def _build_local_ray_param_overrides() -> dict[str, int]:
+    # Ray 2.49 uses a fixed dashboard agent HTTP port (52365) by default.
+    # Multiple independent local Ray clusters on the same host then collide
+    # during node startup. Use dynamic ports by default for local clusters.
+    overrides: dict[str, int] = {
+        "dashboard_agent_listen_port": 0,
+        "metrics_export_port": 0,
+    }
+
+    env_overrides = {
+        "dashboard_agent_listen_port": _read_optional_int_env("SPIDER_RAY_DASHBOARD_AGENT_LISTEN_PORT"),
+        "metrics_agent_port": _read_optional_int_env("SPIDER_RAY_METRICS_AGENT_PORT"),
+        "metrics_export_port": _read_optional_int_env("SPIDER_RAY_METRICS_EXPORT_PORT"),
+        "runtime_env_agent_port": _read_optional_int_env("SPIDER_RAY_RUNTIME_ENV_AGENT_PORT"),
+    }
+    for key, value in env_overrides.items():
+        if value is not None:
+            overrides[key] = value
+    return overrides
+
+
+def _wrap_ray_params_cls_with_overrides(ray_params_cls: type, overrides: dict[str, int]) -> type:
+    class WrappedRayParams(ray_params_cls):
+        def __init__(self, *args, **kwargs):
+            for key, value in overrides.items():
+                kwargs.setdefault(key, value)
+            super().__init__(*args, **kwargs)
+
+    WrappedRayParams.__name__ = f"Wrapped{ray_params_cls.__name__}"
+    return WrappedRayParams
+
+
+@contextmanager
+def _patched_local_ray_params(overrides: dict[str, int]):
+    from ray._private import parameter as ray_parameter
+
+    original_cls = ray_parameter.RayParams
+    ray_parameter.RayParams = _wrap_ray_params_cls_with_overrides(original_cls, overrides)
+    try:
+        yield
+    finally:
+        ray_parameter.RayParams = original_cls
 
 
 @hydra.main(config_path="pkg://agentlightning/verl", config_name="config", version_base=None)
@@ -67,12 +135,24 @@ def run_ppo(
         except AttributeError:
             # verl < 0.6.0
             num_cpus = config.ray_init.num_cpus
-        ray.init(
-            runtime_env={
-                "env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN"}
-            },
-            num_cpus=num_cpus,
-        )
+        ray_param_overrides = _build_local_ray_param_overrides()
+        print(f"[ray] local Ray param overrides: {ray_param_overrides}")
+        include_dashboard = _read_optional_bool_env("SPIDER_RAY_INCLUDE_DASHBOARD")
+        if include_dashboard is None:
+            include_dashboard = False
+        print(f"[ray] include_dashboard={include_dashboard}")
+        with _patched_local_ray_params(ray_param_overrides):
+            ray.init(
+                runtime_env={
+                    "env_vars": {
+                        "TOKENIZERS_PARALLELISM": "true",
+                        "NCCL_DEBUG": "WARN",
+                        "VLLM_LOGGING_LEVEL": "WARN",
+                    }
+                },
+                num_cpus=num_cpus,
+                include_dashboard=include_dashboard,
+            )
 
     runner = TaskRunner.remote()
     ray.get(

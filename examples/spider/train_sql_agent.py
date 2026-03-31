@@ -240,6 +240,38 @@ def _apply_runtime_stability_overrides(config: Dict[str, Any]) -> None:
         print(f"[stability] override rollout.gpu_memory_utilization={util}")
 
 
+def _apply_runtime_path_overrides(config: Dict[str, Any]) -> None:
+    """Apply runtime path overrides so configs stay portable across machines."""
+
+    arr = config.setdefault("actor_rollout_ref", {})
+    model_cfg = arr.setdefault("model", {})
+
+    model_path = os.getenv("SPIDER_MODEL_PATH") or os.getenv("LOCAL_QWEN_MODEL_PATH")
+    if model_path:
+        model_cfg["path"] = model_path
+        print(f"[path] override model.path={model_path}")
+
+
+def _apply_runtime_ray_overrides(config: Dict[str, Any]) -> None:
+    """Bound Ray CPU capacity so local clusters do not grab the whole machine."""
+
+    raw_num_cpus = os.getenv("SPIDER_RAY_NUM_CPUS")
+    if raw_num_cpus is None or raw_num_cpus.strip() == "":
+        raw_num_cpus = os.getenv("SPIDER_N_RUNNERS")
+    if raw_num_cpus is None or raw_num_cpus.strip() == "":
+        return
+
+    try:
+        num_cpus = int(raw_num_cpus)
+    except ValueError as exc:
+        raise ValueError(f"SPIDER_RAY_NUM_CPUS/SPIDER_N_RUNNERS must be an integer, got: {raw_num_cpus!r}") from exc
+    if num_cpus <= 0:
+        raise ValueError(f"SPIDER_RAY_NUM_CPUS/SPIDER_N_RUNNERS must be > 0, got: {num_cpus}")
+
+    config.setdefault("ray_init", {})["num_cpus"] = num_cpus
+    print(f"[ray] override ray_init.num_cpus={num_cpus}")
+
+
 def _resolve_run_root() -> Path:
     """Resolve where per-run logs/config/errors should be written."""
 
@@ -741,7 +773,15 @@ def train(config: Dict[str, Any], active_agent: Optional[str]) -> None:
 
     agent = LitSQLAgent()
     algorithm = agl.VERL(config)
-    trainer = agl.Trainer(n_runners=24, algorithm=algorithm, adapter={"agent_match": active_agent})
+    n_runners_raw = os.getenv("SPIDER_N_RUNNERS", "24")
+    try:
+        n_runners = int(n_runners_raw)
+    except ValueError as exc:
+        raise ValueError(f"SPIDER_N_RUNNERS must be an integer, got: {n_runners_raw!r}") from exc
+    if n_runners <= 0:
+        raise ValueError(f"SPIDER_N_RUNNERS must be > 0, got: {n_runners}")
+    print(f"[runtime] n_runners={n_runners}")
+    trainer = agl.Trainer(n_runners=n_runners, algorithm=algorithm, adapter={"agent_match": active_agent})
     print("Adapter agent match acknowledged:", trainer.adapter.agent_match)  # type: ignore
 
     # 检查关闭标志
@@ -932,7 +972,9 @@ def main() -> None:
     if args.agentlightning_port is not None:
         config.setdefault("agentlightning", {})["port"] = args.agentlightning_port
         print(f"[port] agentlightning.port={args.agentlightning_port}")
+    _apply_runtime_path_overrides(config)
     _apply_runtime_stability_overrides(config)
+    _apply_runtime_ray_overrides(config)
     run_dir = prepare_run_outputs(config, run_label)
     _install_warning_error_logger(run_dir)
     _install_raw_logger(run_dir)

@@ -96,30 +96,32 @@ def _run_rollout(
     table_info_truncate: int,
     execution_truncate: int,
 ) -> tuple[str, float]:
+    temp_dir = Path(tempfile.mkdtemp(prefix="mine_hard_round_", dir=os.environ.get("TMPDIR")))
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_db = Path(temp_dir) / db_path.name
-            shutil.copyfile(db_path, temp_db)
-            agent = SQLAgent(
-                f"sqlite:///{temp_db}",
-                max_turns=max_turns,
-                table_info_truncate=table_info_truncate,
-                execution_truncate=execution_truncate,
-                debug=False,
-                db_schema=schema,
-                endpoint=endpoint,
-                verl_replacement={"model": model, "temperature": temperature},
-            ).graph()
-            result = agent.invoke(
-                {"question": question, "guidance": "", "guidance_level": ""},
-                {"recursion_limit": 100},
-            )
-            query = result.get("query", "") if isinstance(result, dict) else ""
-            reward = evaluate_query(query, ground_truth, str(temp_db), raise_on_error=False)
+        temp_db = temp_dir / db_path.name
+        shutil.copyfile(db_path, temp_db)
+        agent = SQLAgent(
+            f"sqlite:///{temp_db}",
+            max_turns=max_turns,
+            table_info_truncate=table_info_truncate,
+            execution_truncate=execution_truncate,
+            debug=False,
+            db_schema=schema,
+            endpoint=endpoint,
+            verl_replacement={"model": model, "temperature": temperature},
+        ).graph()
+        result = agent.invoke(
+            {"question": question, "guidance": "", "guidance_level": ""},
+            {"recursion_limit": 100},
+        )
+        query = result.get("query", "") if isinstance(result, dict) else ""
+        reward = evaluate_query(query, ground_truth, str(temp_db), raise_on_error=False)
         return query, reward
     except Exception as exc:
         logger.error("Rollout failed: %s", exc)
         return "", 0.0
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def _process_sample(

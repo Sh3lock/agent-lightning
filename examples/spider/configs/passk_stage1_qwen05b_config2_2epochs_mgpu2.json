@@ -11,11 +11,11 @@
     "passk_debug_assert_full_group": false,
     "use_kl_in_reward": false,
     "norm_adv_by_std_in_grpo": true,
-    "expected_rollout_n": 16
+    "expected_rollout_n": 8
   },
   "data": {
     "train_files": "data/train_spider.parquet",
-    "val_files": "data/test_dev_500.parquet",
+    "val_files": "data/test_dev.parquet",
     "train_batch_size": 48,
     "max_prompt_length": 4096,
     "max_response_length": 2048,
@@ -23,9 +23,9 @@
   },
   "actor_rollout_ref": {
     "rollout": {
-      "tensor_model_parallel_size": 1,
-      "n": 16,
-      "log_prob_micro_batch_size_per_gpu": 32,
+      "tensor_model_parallel_size": 2,
+      "n": 8,
+      "log_prob_micro_batch_size_per_gpu": 12,
       "multi_turn": { "format": "hermes" },
       "name": "vllm",
       "gpu_memory_utilization": 0.4,
@@ -39,7 +39,7 @@
     },
     "actor": {
       "ppo_mini_batch_size": 48,
-      "ppo_micro_batch_size_per_gpu": 8,
+      "ppo_micro_batch_size_per_gpu": 12,
       "optim": { "lr": 2e-6 },
       "use_kl_loss": false,
       "kl_loss_coef": 0.0,
@@ -53,7 +53,7 @@
       }
     },
     "ref": {
-      "log_prob_micro_batch_size_per_gpu": 32,
+      "log_prob_micro_batch_size_per_gpu": 12,
       "fsdp_config": {
         "param_offload": false,
         "model_dtype": "bf16"
@@ -67,21 +67,17 @@
     }
   },
   "trainer": {
-    "n_gpus_per_node": 1,
-    "val_before_train": true,
-    "val_only": true,
+    "n_gpus_per_node": 2,
+    "val_before_train": false,
     "critic_warmup": 0,
     "logger": ["console", "wandb"],
     "project_name": "AgentLightning",
-    "experiment_name": "spider_passk_stage1_config2_eval_test_dev500",
+    "experiment_name": "spider_passk_stage1_config2_2epochs_mgpu2",
     "nnodes": 1,
-    "test_freq": 1,
-    "total_epochs": 1,
+    "test_freq": 5,
+    "total_epochs": 2,
     "log_interval": 1,
     "save_freq": 0,
-    "default_local_dir": ".artifacts/examples/spider/ckpt/passk_stage1_config2_eval_test_dev500"
-  },
-  "agentlightning": {
-    "port": 9998
+    "default_local_dir": ".artifacts/examples/spider/ckpt/passk_stage1_config2_2epochs_mgpu2"
   }
 }

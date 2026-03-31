@@ -11,7 +11,7 @@
     "passk_debug_assert_full_group": false,
     "use_kl_in_reward": false,
     "norm_adv_by_std_in_grpo": true,
-    "expected_rollout_n": 16
+    "expected_rollout_n": 8
   },
   "data": {
     "train_files": "data/train_spider.parquet",
@@ -24,8 +24,8 @@
   "actor_rollout_ref": {
     "rollout": {
       "tensor_model_parallel_size": 1,
-      "n": 16,
-      "log_prob_micro_batch_size_per_gpu": 32,
+      "n": 8,
+      "log_prob_micro_batch_size_per_gpu": 12,
       "multi_turn": { "format": "hermes" },
       "name": "vllm",
       "gpu_memory_utilization": 0.4,
@@ -39,7 +39,7 @@
     },
     "actor": {
       "ppo_mini_batch_size": 48,
-      "ppo_micro_batch_size_per_gpu": 8,
+      "ppo_micro_batch_size_per_gpu": 12,
       "optim": { "lr": 2e-6 },
       "use_kl_loss": false,
       "kl_loss_coef": 0.0,
@@ -53,14 +53,14 @@
       }
     },
     "ref": {
-      "log_prob_micro_batch_size_per_gpu": 32,
+      "log_prob_micro_batch_size_per_gpu": 12,
       "fsdp_config": {
         "param_offload": false,
         "model_dtype": "bf16"
       }
     },
     "model": {
-      "path": "/home/storage/wenbinxing/ltf/model/Qwen2.5-Coder-0.5B-Instruct",
+      "path": "Qwen/Qwen2.5-Coder-0.5B-Instruct",
       "use_remove_padding": true,
       "enable_gradient_checkpointing": true,
       "dtype": "bfloat16"
@@ -78,6 +78,6 @@
     "total_epochs": 2,
     "log_interval": 1,
     "save_freq": 0,
-    "default_local_dir": "/home/storage/wenbinxing/ltf/passk/agent-lightning/examples/spider/ckpt_passk_stage1_config2_2epochs"
+    "default_local_dir": ".artifacts/examples/spider/ckpt/passk_stage1_config2_2epochs"
   }
 }

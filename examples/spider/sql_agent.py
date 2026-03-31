@@ -33,6 +33,32 @@ import agentlightning as agl
 agl.setup_logging(apply_to=[__name__])
 
 logger = logging.getLogger(__name__)
+
+_CONTEXT_WINDOW_RE = re.compile(
+    r"maximum context length is (?P<context>\d+) tokens and your request has (?P<input>\d+) input tokens",
+    re.IGNORECASE,
+)
+
+
+def _extract_safe_retry_max_tokens(
+    error: Exception | str,
+    *,
+    requested_max_tokens: int = 2048,
+    reserve_tokens: int = 16,
+    min_retry_tokens: int = 32,
+) -> int | None:
+    """Parse context-window errors and derive a smaller max_tokens budget."""
+    message = str(error)
+    match = _CONTEXT_WINDOW_RE.search(message)
+    if not match:
+        return None
+
+    context_window = int(match.group("context"))
+    input_tokens = int(match.group("input"))
+    available = context_window - input_tokens - reserve_tokens
+    if available < min_retry_tokens:
+        return None
+    return min(requested_max_tokens, available)
 _LOG_ROLLOUT_INFO = os.getenv("SPIDER_LOG_ROLLOUT_INFO", "0").lower() in {"1", "true", "yes", "on"}
 
 
@@ -260,8 +286,21 @@ class SQLAgent:
             result = self.llm.invoke(prompt_messages)
         except Exception as e:
             logger.error(f"Failed to invoke prompt: {e}")
-            # FIXME: fallback to create a random trajectory
-            result = self.llm.invoke([HumanMessage(content="Please create a random SQL query as an example.")])
+            retry_max_tokens = _extract_safe_retry_max_tokens(e)
+            if retry_max_tokens is not None:
+                logger.warning(
+                    "Retrying prompt with reduced max_tokens=%s after context window error.",
+                    retry_max_tokens,
+                )
+                try:
+                    result = self.llm.bind(max_tokens=retry_max_tokens).invoke(prompt_messages)
+                except Exception as retry_error:
+                    logger.error(f"Retry with reduced max_tokens failed: {retry_error}")
+                    # FIXME: fallback to create a random trajectory
+                    result = self.llm.invoke([HumanMessage(content="Please create a random SQL query as an example.")])
+            else:
+                # FIXME: fallback to create a random trajectory
+                result = self.llm.invoke([HumanMessage(content="Please create a random SQL query as an example.")])
 
         if self.debug:
             termcolor.cprint(result.pretty_repr(), "green")
@@ -513,7 +552,8 @@ class LitSQLAgent(agl.LitAgent[Dict[str, Any]]):
 
         rollout_id = rollout.rollout_id
 
-        with tempfile.TemporaryDirectory() as temp_dir:
+        # Some tool chains leave delayed files in the temp dir; don't fail rollout on cleanup race.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             db_path = os.path.join(temp_dir, os.path.basename(original_db_path))
             shutil.copyfile(original_db_path, db_path)
             _rollout_log("[Rollout %s] Question: %s", rollout_id, question)
